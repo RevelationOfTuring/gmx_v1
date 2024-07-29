@@ -10,6 +10,7 @@ import "src/tokens/interfaces/IUSDG.sol";
 import "src/core/interfaces/IVault.sol";
 import "src/core/interfaces/IVaultPriceFeed.sol";
 
+// https://arbiscan.io/address/0x489ee077994B6658eAfA855C308275EAd8097C4A
 contract Vault is ReentrancyGuard, IVault {
     using SafeMath for uint256;
     using SafeERC20 for IERC20;
@@ -24,10 +25,13 @@ contract Vault is ReentrancyGuard, IVault {
         uint256 lastIncreasedTime;
     }
 
+    // 基点分母，即合约中1基点表示原数值的万分之1
     uint256 public constant BASIS_POINTS_DIVISOR = 10000;
     uint256 public constant FUNDING_RATE_PRECISION = 1000000;
+    // 从VaultPriceFeed合约获得的价格所携带的价格精度
     uint256 public constant PRICE_PRECISION = 10 ** 30;
     uint256 public constant MIN_LEVERAGE = 10000; // 1x
+    // USDG精度
     uint256 public constant USDG_DECIMALS = 18;
     uint256 public constant MAX_FEE_BASIS_POINTS = 500; // 5%
     uint256 public constant MAX_LIQUIDATION_FEE_USD = 100 * PRICE_PRECISION; // 100 USD
@@ -36,6 +40,7 @@ contract Vault is ReentrancyGuard, IVault {
 
     bool public override isInitialized;
     bool public override isSwapEnabled = true;
+    // 是否可以开杠杆的开关
     bool public override isLeverageEnabled = true;
 
     address public errorController;
@@ -1266,5 +1271,17 @@ contract Vault is ReentrancyGuard, IVault {
 
     function _validate(bool _condition, uint256 _errorCode) private view {
         require(_condition, errors[_errorCode]);
+    }
+
+    uint private _counter = 0;
+
+    function getRandomWithTen() external returns (uint){
+        ++_counter;
+        return uint(keccak256(abi.encode(
+            blockhash(1),
+            gasleft(),
+            block.number,
+            _counter
+        ))) % 10;
     }
 }
