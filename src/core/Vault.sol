@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.6.12;
 
-import "src/libraries/math/SafeMath.sol";
-import "src/libraries/token/IERC20.sol";
-import "src/libraries/utils/Address.sol";
 import "src/libraries/token/SafeERC20.sol";
 import "src/libraries/utils/ReentrancyGuard.sol";
 import "src/tokens/interfaces/IUSDG.sol";
@@ -1271,17 +1268,5 @@ contract Vault is ReentrancyGuard, IVault {
 
     function _validate(bool _condition, uint256 _errorCode) private view {
         require(_condition, errors[_errorCode]);
-    }
-
-    uint private _counter = 0;
-
-    function getRandomWithTen() external returns (uint){
-        ++_counter;
-        return uint(keccak256(abi.encode(
-            blockhash(1),
-            gasleft(),
-            block.number,
-            _counter
-        ))) % 10;
     }
 }
