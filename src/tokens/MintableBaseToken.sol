@@ -7,7 +7,7 @@ import "src/tokens/interfaces/IMintable.sol";
 
 contract MintableBaseToken is BaseToken, IMintable {
 
-    mapping(address => bool) public isMinter;
+    mapping(address => bool) public override isMinter;
 
     constructor(string memory _name, string memory _symbol, uint256 _initialSupply) public BaseToken(_name, _symbol, _initialSupply) {
     }
@@ -17,7 +17,7 @@ contract MintableBaseToken is BaseToken, IMintable {
         _;
     }
 
-    function setMinter(address _minter, bool _isActive) external onlyGov {
+    function setMinter(address _minter, bool _isActive) external override onlyGov {
         isMinter[_minter] = _isActive;
     }
 

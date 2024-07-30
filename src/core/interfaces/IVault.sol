@@ -164,4 +164,16 @@ interface IVault {
     function getDelta(address _indexToken, uint256 _size, uint256 _averagePrice, bool _isLong, uint256 _lastIncreasedTime) external view returns (bool, uint256);
 
     function getPosition(address _account, address _collateralToken, address _indexToken, bool _isLong) external view returns (uint256, uint256, uint256, uint256, uint256, uint256, bool, uint256);
+
+    function setMaxLeverage(uint256 _maxLeverage) external;
+
+    function setFundingRate(uint256 _fundingInterval, uint256 _fundingRateFactor, uint256 _stableFundingRateFactor) external;
+
+    function setBufferAmount(address _token, uint256 _amount) external;
+
+    function setUsdgAmount(address _token, uint256 _amount) external;
+
+    function setInPrivateLiquidationMode(bool _inPrivateLiquidationMode) external;
+
+    function setLiquidator(address _liquidator, bool _isActive) external;
 }

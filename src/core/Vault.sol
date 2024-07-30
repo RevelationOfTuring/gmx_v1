@@ -41,61 +41,95 @@ contract Vault is ReentrancyGuard, IVault {
     // 是否可以开杠杆的开关
     bool public override isLeverageEnabled = true;
 
+    // 具有修改mapping {errors}内容权限的地址，即VaultErrorController合约地址
     address public errorController;
 
+    // Router合约地址
     address public override router;
+    // VaultPriceFeed合约地址
     address public override priceFeed;
-
+    // USDG合约地址
     address public override usdg;
+    // gov地址
     address public override gov;
 
+    // token白名单中的token个数，即可以做流动性的token个数
     uint256 public override whitelistedTokenCount;
 
     uint256 public override maxLeverage = 50 * 10000; // 50x
 
     uint256 public override liquidationFeeUsd;
+    // 税费基点，即在动态手续费计算中，用于计算手续费减免和新增的基础基点
+    // 主网该值目前是60
     uint256 public override taxBasisPoints = 50; // 0.5%
     uint256 public override stableTaxBasisPoints = 20; // 0.2%
+    // buyUSDG和sellUSDG时，使用的手续费基点
+    // 主网该值目前是25
     uint256 public override mintBurnFeeBasisPoints = 30; // 0.3%
     uint256 public override swapFeeBasisPoints = 30; // 0.3%
     uint256 public override stableSwapFeeBasisPoints = 4; // 0.04%
     uint256 public override marginFeeBasisPoints = 10; // 0.1%
 
     uint256 public override minProfitTime;
+    // 计算手续费时使用动态手续费的开关
+    // 主网该值目前是true
     bool public override hasDynamicFees = false;
 
+    // 资金费率的更新时间间隔
+    // 主网该值目前是3600，即1 hour
     uint256 public override fundingInterval = 8 hours;
+    // 非稳定币的资金费率因数
+    // 主网该值目前是100
     uint256 public override fundingRateFactor;
+    // 稳定币的资金费率因数
+    // 主网该值目前是100
     uint256 public override stableFundingRateFactor;
+    // 当前全部白名单token的总权重
     uint256 public override totalTokenWeights;
 
     bool public includeAmmPrice = true;
+    // 从VaultPriceFeed合约获得的价格时携带的一个参数标志位，但是在VaultPrinceFeed合约的{getPrice}方法的具体实现中并未真正使用到该参数
     bool public useSwapPricing = false;
 
+    // vault合约进入manager模式的开关
+    // 注：在manager模式下，{buyUSDG}和{sellUSDG}只有manager才可以调用。目前线上Vault合约是处于manager模式。
     bool public override inManagerMode = false;
     bool public override inPrivateLiquidationMode = false;
 
+    // 合约接受交易的gqs price上限，用于防MEV
     uint256 public override maxGasPrice;
 
     mapping(address => mapping(address => bool)) public override approvedRouters;
     mapping(address => bool) public override isLiquidator;
+    // manager名单
     mapping(address => bool) public override isManager;
 
+    // 所有添加过的白名单token列表（如果某token添加后又被移除了，那么该token也会存在于该列表中）
     address[] public override allWhitelistedTokens;
 
+    // token地址 -> 该token是否在当前的白名单内
     mapping(address => bool) public override whitelistedTokens;
+    // token地址 -> 该token的decimals
     mapping(address => uint256) public override tokenDecimals;
+    // token地址 -> 该token最小的盈利基点
     mapping(address => uint256) public override minProfitBasisPoints;
+    // token地址 -> 该token是否是稳定币
     mapping(address => bool) public override stableTokens;
+    // token地址 -> 该token是否可以做空
     mapping(address => bool) public override shortableTokens;
 
     // tokenBalances is used only to determine _transferIn values
+    // token地址 -> （经过{_transferIn}统计）本合约当下的该token的余额
+    // 注：每当有token的转入操作就会调用{_transferIn}来更新本mapping
     mapping(address => uint256) public override tokenBalances;
 
     // tokenWeights allows customisation of index composition
+    // token地址 -> 该token的权重
     mapping(address => uint256) public override tokenWeights;
 
     // usdgAmounts tracks the amount of USDG debt for each whitelisted token
+    // token地址 -> 为该token产生的USDG债务（USDG计价）
+    // 注：使用该token在不同时间点购买USDG的债务累计和（USDG计价）
     mapping(address => uint256) public override usdgAmounts;
 
     // maxUsdgAmounts allows setting a max amount of USDG debt for a token
@@ -103,9 +137,12 @@ contract Vault is ReentrancyGuard, IVault {
 
     // poolAmounts tracks the number of received tokens that can be used for leverage
     // this is tracked separately from tokenBalances to exclude funds that are deposited as margin collateral
+    // token地址 -> 全局可用于开杠杆的该token的数量
+    // 注：poolAmounts与tokenBalances不一样，前者中不包含已抵押作为保证金的该token数量
     mapping(address => uint256) public override poolAmounts;
 
     // reservedAmounts tracks the number of tokens reserved for open leverage positions
+    // token地址 -> 目前池中已用于开杠杆的该token数量（即锁定在未平仓杠杆头寸中的token数量）
     mapping(address => uint256) public override reservedAmounts;
 
     // bufferAmounts allows specification of an amount to exclude from swaps
@@ -120,14 +157,22 @@ contract Vault is ReentrancyGuard, IVault {
     mapping(address => uint256) public override guaranteedUsd;
 
     // cumulativeFundingRates tracks the funding rates based on utilization
+    // token地址 -> 该token累计的资金费率
     mapping(address => uint256) public override cumulativeFundingRates;
     // lastFundingTimes tracks the last time funding was updated for a token
+    // token地址 -> 最近一次更新该token的funding的时间戳
     mapping(address => uint256) public override lastFundingTimes;
 
     // positions tracks all open positions
     mapping(bytes32 => Position) public positions;
 
     // feeReserves tracks the amount of fees per token
+    // token地址 -> 使用针对该token产生的手续费总和
+    // 产生手续费的地方：
+    // 1. 使用该token购买USDG；
+    // 2. // todo
+    // 3. 清算使用该token作为抵押物的仓位；
+    // 4.
     mapping(address => uint256) public override feeReserves;
 
     mapping(address => uint256) public override globalShortSizes;
@@ -244,26 +289,32 @@ contract Vault is ReentrancyGuard, IVault {
         errors[_errorCode] = _error;
     }
 
+    // 返回全部添加过的白名单token列表长度
     function allWhitelistedTokensLength() external override view returns (uint256) {
         return allWhitelistedTokens.length;
     }
 
+    // gov管理manager模式的开关
     function setInManagerMode(bool _inManagerMode) external override {
+        // 校验msg.sender是gov
         _onlyGov();
         inManagerMode = _inManagerMode;
     }
 
+    // gov管理manger状态
     function setManager(address _manager, bool _isManager) external override {
+        // 校验msg.sender是gov
         _onlyGov();
+        // 设置管理员状态
         isManager[_manager] = _isManager;
     }
 
-    function setInPrivateLiquidationMode(bool _inPrivateLiquidationMode) external {
+    function setInPrivateLiquidationMode(bool _inPrivateLiquidationMode) external override {
         _onlyGov();
         inPrivateLiquidationMode = _inPrivateLiquidationMode;
     }
 
-    function setLiquidator(address _liquidator, bool _isActive) external {
+    function setLiquidator(address _liquidator, bool _isActive) external override {
         _onlyGov();
         isLiquidator[_liquidator] = _isActive;
     }
@@ -293,13 +344,13 @@ contract Vault is ReentrancyGuard, IVault {
         priceFeed = _priceFeed;
     }
 
-    function setMaxLeverage(uint256 _maxLeverage) external {
+    function setMaxLeverage(uint256 _maxLeverage) external override {
         _onlyGov();
         _validate(_maxLeverage > MIN_LEVERAGE, 2);
         maxLeverage = _maxLeverage;
     }
 
-    function setBufferAmount(address _token, uint256 _amount) external {
+    function setBufferAmount(address _token, uint256 _amount) external override {
         _onlyGov();
         bufferAmounts[_token] = _amount;
     }
@@ -334,7 +385,7 @@ contract Vault is ReentrancyGuard, IVault {
         hasDynamicFees = _hasDynamicFees;
     }
 
-    function setFundingRate(uint256 _fundingInterval, uint256 _fundingRateFactor, uint256 _stableFundingRateFactor) external {
+    function setFundingRate(uint256 _fundingInterval, uint256 _fundingRateFactor, uint256 _stableFundingRateFactor) external override {
         _onlyGov();
         _validate(_fundingInterval >= MIN_FUNDING_RATE_INTERVAL, 10);
         _validate(_fundingRateFactor <= MAX_FUNDING_RATE_FACTOR, 11);
@@ -344,59 +395,99 @@ contract Vault is ReentrancyGuard, IVault {
         stableFundingRateFactor = _stableFundingRateFactor;
     }
 
+    // gov向token白名单中添加token并做相关参数的设置（可新增新的token，也可更新之前已有的）
     function setTokenConfig(
+    // 目标token地址
         address _token,
+    // 目标token的精度
         uint256 _tokenDecimals,
+    // 目标token权重
         uint256 _tokenWeight,
+    // 目标token的最小盈利基点
         uint256 _minProfitBps,
+    // 允许为目标token产生的最大USDG债务
         uint256 _maxUsdgAmount,
+    // 目标token是否是稳定币
         bool _isStable,
+    // 目标token是否允许做空
         bool _isShortable
     ) external override {
+        // msg.sender必须是gov
         _onlyGov();
         // increment token count for the first time
         if (!whitelistedTokens[_token]) {
+            // 如果_token不在当前token白名单中，whitelistedTokenCount自增1
             whitelistedTokenCount = whitelistedTokenCount.add(1);
+            // 向allWhitelistedTokens中追加_token
             allWhitelistedTokens.push(_token);
         }
 
+        // _totalTokenWeights为全局的token总权重
         uint256 _totalTokenWeights = totalTokenWeights;
+        // _totalTokenWeights自减_token对应的权重（如果是新增token，tokenWeights[_token]为0）
         _totalTokenWeights = _totalTokenWeights.sub(tokenWeights[_token]);
 
+        // 将_token加入token白名单
         whitelistedTokens[_token] = true;
+        // 记录_token的精度
         tokenDecimals[_token] = _tokenDecimals;
+        // 记录_token的权重
         tokenWeights[_token] = _tokenWeight;
+        // 记录_token的最小盈利基点
         minProfitBasisPoints[_token] = _minProfitBps;
+        // 记录允许为_token产生的USDG债务上限
         maxUsdgAmounts[_token] = _maxUsdgAmount;
+        // 记录_token是否是稳定币
         stableTokens[_token] = _isStable;
+        // 记录_token是否可以做空
         shortableTokens[_token] = _isShortable;
-
+        // 更新全局的totalTokenWeights，值为_totalTokenWeights + 本次设置的token权重
         totalTokenWeights = _totalTokenWeights.add(_tokenWeight);
 
         // validate price feed
+        // 获取一次_token的最大价格，用于验证_token价格的获取是否正常
         getMaxPrice(_token);
     }
 
+    // gov从token白名单中删除_token，并清除所有与其相关的配置
     function clearTokenConfig(address _token) external {
+        // msg.sender必须是gov
         _onlyGov();
+        // 要求_token为在册token白名单成员
         _validate(whitelistedTokens[_token], 13);
+        // 全局的token总权重自减合约中记录的_token的权重
         totalTokenWeights = totalTokenWeights.sub(tokenWeights[_token]);
+        // 从白名单中注销_token
         delete whitelistedTokens[_token];
+        // 删除合约中记录的_token精度
         delete tokenDecimals[_token];
+        // 删除合约中记录的_token权重
         delete tokenWeights[_token];
+        // 删除合约中记录的_token最小盈利基点
         delete minProfitBasisPoints[_token];
+        // 删除合约中记录的允许为_token产生的USDG债务上限
         delete maxUsdgAmounts[_token];
+        // 删除合约中记录的_token是否为稳定币
         delete stableTokens[_token];
+        // 删除合约中记录的_token是否可以做空
         delete shortableTokens[_token];
+        // token白名单元素个数自减1
         whitelistedTokenCount = whitelistedTokenCount.sub(1);
     }
 
+    // gov从本合约中取出_token累计的手续费，接收人为_receiver
     function withdrawFees(address _token, address _receiver) external override returns (uint256) {
+        // msg.sender必须是gov
         _onlyGov();
+        // 获取_token目前累计的手续费数量
         uint256 amount = feeReserves[_token];
+        // 如果amount为0，直接返回0
         if (amount == 0) {return 0;}
+        // _token目前累计的手续费数量清0
         feeReserves[_token] = 0;
+        // 从本合约转移数量为_amount的_token转移给_receiver
         _transferOut(_token, amount, _receiver);
+        // 返回本次转出的手续费数量
         return amount;
     }
 
@@ -408,7 +499,7 @@ contract Vault is ReentrancyGuard, IVault {
         approvedRouters[msg.sender][_router] = false;
     }
 
-    function setUsdgAmount(address _token, uint256 _amount) external {
+    function setUsdgAmount(address _token, uint256 _amount) external override {
         _onlyGov();
 
         uint256 usdgAmount = usdgAmounts[_token];
@@ -437,33 +528,56 @@ contract Vault is ReentrancyGuard, IVault {
     }
 
     function buyUSDG(address _token, address _receiver) external override nonReentrant returns (uint256) {
+        // 检验msg.sender为在册的manager
         _validateManager();
+        // 检验_token为在册白名单token
         _validate(whitelistedTokens[_token], 16);
 
+        // tokenAmount为转入vault合约的_token数量，即购买USDG的_token数量
         uint256 tokenAmount = _transferIn(_token);
+        // 要求转入_token数量不为0
         _validate(tokenAmount > 0, 17);
 
+        // 更新_token的累计资金费率和最近一次更新资金费率的时间戳（如果当前距离上一次更新资金费率不到8小时，什么都不做）
         updateCumulativeFundingRate(_token);
 
+        // price为获取的_token的小价格（decimal为30）
         uint256 price = getMinPrice(_token);
 
+        // usdgAmount为转入_token的USD价值（带_token精度）
+        // 即：tokenAmount * _token的小价格(带价格decimal) / 价格decimal
         uint256 usdgAmount = tokenAmount.mul(price).div(PRICE_PRECISION);
+        // 将usdgAmount移除_token精度，并提升到USDG精度
+        // 此时，usdgAmount为购买USDG的全部_token的USDG价值
         usdgAmount = adjustForDecimals(usdgAmount, _token, usdg);
+        // 要求usdgAmount大于0
         _validate(usdgAmount > 0, 18);
 
+        // 根据添加流动性_token的USDG价值，计算购买USDG要花费的手续费基点
+        // 注：增加债务数量为usdgAmount，使用的基础手续费为mintBurnFeeBasisPoints，动态手续费减免或新增的基础基点为taxBasisPoints
         uint256 feeBasisPoints = getFeeBasisPoints(_token, usdgAmount, mintBurnFeeBasisPoints, taxBasisPoints, true);
+        // 收swap的手续费，amountAfterFees为扣除手续费后的_token数量
         uint256 amountAfterFees = _collectSwapFees(_token, tokenAmount, feeBasisPoints);
+        // mintAmount为扣除手续费后的_token的USD价值（带_token精度）
+        // 即：扣除手续费后的_token数量 * _token的小价格(带价格decimal) / 价格decimal
         uint256 mintAmount = amountAfterFees.mul(price).div(PRICE_PRECISION);
+        // 将mintAmount移除_token精度，并提升到USDG精度
+        // 此时，mintAmount扣除手续费后全部购买USDG的_token的USDG价值
         mintAmount = adjustForDecimals(mintAmount, _token, usdg);
 
+        // 增加为_token的产生的USDG债务，债务增量为_amount（以USDG计价）
         _increaseUsdgAmount(_token, mintAmount);
+        // 增加全局可用于开杠杆的_token的数量，增量为扣除手续费后的_token数量
+        // 注：此时用户购买USDG的_token流向了两个地方：1. poolAmounts[_token] 2.feeReserves[_token]
         _increasePoolAmount(_token, amountAfterFees);
-
+        // 为_receiver增发mintAmount数量的USDG
         IUSDG(usdg).mint(_receiver, mintAmount);
 
+        // 抛出事件
         emit BuyUSDG(_receiver, _token, tokenAmount, mintAmount, feeBasisPoints);
-
+        // 标志位useSwapPricing设置为false（该标志位实际上无作用，可以删除）
         useSwapPricing = false;
+        // 返回增发的USDG数量
         return mintAmount;
     }
 
@@ -807,16 +921,28 @@ contract Vault is ReentrancyGuard, IVault {
         return tokenToUsdMin(_token, getRedemptionCollateral(_token));
     }
 
+    // 精度调整。由于USDG和所有白名单token都有decimal，一些业务数值需要精度之间的转换
+    // 即将业务数值_amount赋予_tokenMul的精度，然后再去除_tokenDiv的精度
+    // 计算逻辑为： 输入_amount值先扩大_tokenMul的精度，然后再缩小_tokenDiv的精度
     function adjustForDecimals(uint256 _amount, address _tokenDiv, address _tokenMul) public view returns (uint256) {
+        // _tokenDiv和_tokenMul都是token地址，处理逻辑一样即：
+        // 如果_tokenXxx是USDG地址，那么decimalXxx就是USDG的精度；如果_tokenXxx不是USDG地址，那么decimalXxx就是该token的精度（tokenDecimals[_tokenXxx]）
         uint256 decimalsDiv = _tokenDiv == usdg ? USDG_DECIMALS : tokenDecimals[_tokenDiv];
         uint256 decimalsMul = _tokenMul == usdg ? USDG_DECIMALS : tokenDecimals[_tokenMul];
+        // 精度转换：amount * (10^decimalsMul) / (10^decimalsDiv)
         return _amount.mul(10 ** decimalsMul).div(10 ** decimalsDiv);
     }
 
+    // 计算当前_tokenAmount数量的_token的USD价值（单价为_token的小价格）
+    // 注：返回值的带有价格精度PRICE_PRECISION
     function tokenToUsdMin(address _token, uint256 _tokenAmount) public override view returns (uint256) {
+        // 如果amount为0，返回0
         if (_tokenAmount == 0) {return 0;}
+        // 获取_token当前的小价格（带价格decimal）
         uint256 price = getMinPrice(_token);
+        // 获取_token的精度
         uint256 decimals = tokenDecimals[_token];
+        // 计算USD价值，即_tokenAmount * token小价格 / 10^_token的精度
         return _tokenAmount.mul(price).div(10 ** decimals);
     }
 
@@ -861,31 +987,52 @@ contract Vault is ReentrancyGuard, IVault {
         ));
     }
 
+    // 更新_token的累积的资金费率（如果当前距离上一次更新资金费率不到8小时，什么都不做）
+    // 注：会更新两个mapping：lastFundingTimes[_token]（最近一次更新_token的资金费率时间戳）和cumulativeFundingRates[_token]（_token的累计资金费率）
     function updateCumulativeFundingRate(address _token) public {
         if (lastFundingTimes[_token] == 0) {
+            // 如果是第一次更新_token的funding rate
+            // lastFundingTimes[_token]为 当前时间戳 / 8 hours * 8 hours
             lastFundingTimes[_token] = block.timestamp.div(fundingInterval).mul(fundingInterval);
+            // 直接返回
             return;
         }
 
         if (lastFundingTimes[_token].add(fundingInterval) > block.timestamp) {
+            // 如果当前时间戳距离上一次更新资金费率不到8小时
+            // 什么都不做，直接返回
             return;
         }
 
+        // 如果非第一次更新资金费率 && 当前时间戳距离上一次更新资金费率大于等于8小时
+        // fundingRate为_token的下一个时间区间的资金费率
         uint256 fundingRate = getNextFundingRate(_token);
+        // _token的累计资金费率自增fundingRate
         cumulativeFundingRates[_token] = cumulativeFundingRates[_token].add(fundingRate);
+        // _token的最近更新资金费率的时间戳更新为：当前时间戳 / 8 hours * 8 hours
         lastFundingTimes[_token] = block.timestamp.div(fundingInterval).mul(fundingInterval);
-
+        // 抛出事件
         emit UpdateFundingRate(_token, cumulativeFundingRates[_token]);
     }
 
+    // 获取_token的下一个时间区间的资金费率
+    // 注：reservedAmounts[_token]/poolAmounts[_token]越大，资金费率越高
     function getNextFundingRate(address _token) public override view returns (uint256) {
+        // 如果当前时间戳距离上一次更新资金费率小于8小时，不需要更新资金费率，直接返回0
         if (lastFundingTimes[_token].add(fundingInterval) > block.timestamp) {return 0;}
 
+        // 如果当前时间戳距离上一次更新资金费率大于等于8小时
+        // intervals为(当前时间戳 - 上一次更新资金费率的时间戳)/8 hours，即当前距离上一次更新资金费率有多少个8 hours
         uint256 intervals = block.timestamp.sub(lastFundingTimes[_token]).div(fundingInterval);
+        // poolAmount为目前可用于开杠杆的_token的数量
         uint256 poolAmount = poolAmounts[_token];
+        // 如果可用于开杠杆的_token的数量为0，那也不需要资金费率了，直接返回0
         if (poolAmount == 0) {return 0;}
 
+        // 如果可用于开杠杆的_token的数量不为0
+        // 根据_token是否为稳定币，决定资金费率因数_fundingRateFactor是stableFundingRateFactor或fundingRateFactor
         uint256 _fundingRateFactor = stableTokens[_token] ? stableFundingRateFactor : fundingRateFactor;
+        // 下一个时间区间的资金费率为：资金费率因数 * intervals *（目前已锁定在未平仓杠杆头寸中的token数量 / 目前可用于开杠杆的_token的数量）
         return _fundingRateFactor.mul(reservedAmounts[_token]).mul(intervals).div(poolAmount);
     }
 
@@ -999,39 +1146,74 @@ contract Vault is ReentrancyGuard, IVault {
     // 6. initialAmount is close to targetAmount, action reduces balance largely => low tax
     // 7. initialAmount is above targetAmount, nextAmount is below targetAmount and vice versa
     // 8. a large swap should have similar fees as the same trade split into multiple smaller swaps
+
+    // 获取手续费基点
+    // 参数：
+    // - _token：目标token；
+    // - _usdgDelta：USDG债务的改变量；
+    // - _feeBasisPoints：默认的手续费基点；
+    // - _taxBasisPoints：税费基点。即在动态手续费计算中，用于计算手续费减免和增加的基础基点；
+    // - _increment：true表示增加债务，false表示减少债务。
     function getFeeBasisPoints(address _token, uint256 _usdgDelta, uint256 _feeBasisPoints, uint256 _taxBasisPoints, bool _increment) public override view returns (uint256) {
+        // 如果不使用动态手续费，直接返回_feeBasisPoints作为手续费基点
         if (!hasDynamicFees) {return _feeBasisPoints;}
 
+        // 如果使用动态手续费
+        // initialAmount是为_token产生的全部USDG债务（USDG计价）
         uint256 initialAmount = usdgAmounts[_token];
+        // nextAmount = initialAmount + _usdgDelta，即增加债务
         uint256 nextAmount = initialAmount.add(_usdgDelta);
         if (!_increment) {
+            // 如果是减少债务，判断_usdgDelta是否大于为_token产生的全部USDG债务（USDG计价）
+            // - 如果大于，那么nextAmount清0，即全部债务清零
+            // - 如果不大于，nextAmount为initialAmount - _usdgDelta
             nextAmount = _usdgDelta > initialAmount ? 0 : initialAmount.sub(_usdgDelta);
         }
 
+        // targetAmount是按照_token权重占token总权重的百分比计算出的_token产生的USDG的数量
         uint256 targetAmount = getTargetUsdgAmount(_token);
+        // 如果targetAmount为0，直接返回_feeBasisPoints
         if (targetAmount == 0) {return _feeBasisPoints;}
 
+        // initialDiff是 债务改变前，_token实际产生的USDG总债务 与 按照_token权重占token总权重的百分比计算出的USDG数量的差值
         uint256 initialDiff = initialAmount > targetAmount ? initialAmount.sub(targetAmount) : targetAmount.sub(initialAmount);
+        // nextDiff是 债务改变后，_token实际产生的USDG总债务 与 按照_token权重占token总权重的百分比计算出的USDG数量的差值
         uint256 nextDiff = nextAmount > targetAmount ? nextAmount.sub(targetAmount) : targetAmount.sub(nextAmount);
 
         // action improves relative asset balance
         if (nextDiff < initialDiff) {
+            // 如果债务改变后，_token实际产生的USDG总债务 与 按照_token权重占token总权重的百分比计算出的USDG数量的差值变小了，手续费上将获部分减免
+            // rebateBps是减免的基点，计算公式为 _taxBasisPoints * initialDiff / targetAmount
             uint256 rebateBps = _taxBasisPoints.mul(initialDiff).div(targetAmount);
+            // 最后的手续费基点为：
+            // 如果rebateBps>_feeBasisPoints，直接不收手续费；
+            // 如果rebateBps<_feeBasisPoints，最终手续费为_feeBasisPoints - rebateBps
             return rebateBps > _feeBasisPoints ? 0 : _feeBasisPoints.sub(rebateBps);
         }
 
+        // 如果债务改变后，_token实际产生的USDG总债务 与 按照_token权重占token总权重的百分比计算出的USDG数量的差值没变小，手续费基点将变大
+        // averageDiff是债务改变前后的diff均值，即(initialDiff + nextDiff)/2
         uint256 averageDiff = initialDiff.add(nextDiff).div(2);
         if (averageDiff > targetAmount) {
+            // averageDiff的上限是targetAmount
             averageDiff = targetAmount;
         }
+        // 手续费增加的基点为 _taxBasisPoints * averageDiff / targetAmount
+        // 注：由于averageDiff<=targetAmount, 所以这续费增加的这部分基点taxBps最大为_taxBasisPoints
         uint256 taxBps = _taxBasisPoints.mul(averageDiff).div(targetAmount);
+        // 最终手续费为_feeBasisPoints + taxBps
         return _feeBasisPoints.add(taxBps);
     }
 
+    // 返回全部产生USDG中，由_token产生的USDG的数量。即按照_token权重占token总权重的百分比计算
     function getTargetUsdgAmount(address _token) public view returns (uint256) {
+        // supply为当前usdg的总发行量
         uint256 supply = IERC20(usdg).totalSupply();
+        // 如果usdg无发行量，直接返回0
         if (supply == 0) {return 0;}
+        // 获取_token的权重
         uint256 weight = tokenWeights[_token];
+        // 返回 usdg总发行量 * (_token权重 / token总权重)
         return weight.mul(supply).div(totalTokenWeights);
     }
 
@@ -1137,11 +1319,18 @@ contract Vault is ReentrancyGuard, IVault {
         _validate(shortableTokens[_indexToken], 48);
     }
 
+    // 收swap手续费，返回值为扣除手续费后的_token数量
+    // _token和_amount确定了输入的token种类和数量，_feeBasisPoints为使用的手续费基点
     function _collectSwapFees(address _token, uint256 _amount, uint256 _feeBasisPoints) private returns (uint256) {
+        // 扣除手续费后的值： _amount * (10000 - 手续费基点) / 10000
         uint256 afterFeeAmount = _amount.mul(BASIS_POINTS_DIVISOR.sub(_feeBasisPoints)).div(BASIS_POINTS_DIVISOR);
+        // 作为手续费的_token数量：_amount - afterFeeAmount
         uint256 feeAmount = _amount.sub(afterFeeAmount);
+        // _token的累计手续费自增feeAmount
         feeReserves[_token] = feeReserves[_token].add(feeAmount);
+        // 抛出事件（手续费token种类，手续费的token数量，手续费的USD价值（小价格)）
         emit CollectSwapFees(_token, feeAmount, tokenToUsdMin(_token, feeAmount));
+        // 返回扣除手续费后的_token数量
         return afterFeeAmount;
     }
 
@@ -1158,28 +1347,43 @@ contract Vault is ReentrancyGuard, IVault {
         return feeUsd;
     }
 
+    // 向本合约转移_token后，同步更新tokenBalances[_token]并返回向本合约转移的_token数量
     function _transferIn(address _token) private returns (uint256) {
+        // 向本合约转移_token之前的tokenBalances[_token]
         uint256 prevBalance = tokenBalances[_token];
+        // nextBalance为转移后本合约名下的_token余额
         uint256 nextBalance = IERC20(_token).balanceOf(address(this));
+        // 更新tokenBalances[_token]为转移后本合约名下的_token余额
         tokenBalances[_token] = nextBalance;
-
+        // 返回向本合约转入的_token数量
         return nextBalance.sub(prevBalance);
     }
 
+    // 从本合约转移数量为_amount的_token转移给_receiver
     function _transferOut(address _token, uint256 _amount, address _receiver) private {
+        // 将本合约名下数量为_amount的_token转移给_receiver
         IERC20(_token).safeTransfer(_receiver, _amount);
+        // tokenBalances[_token]更新为转移后本合约名下的_token余额
         tokenBalances[_token] = IERC20(_token).balanceOf(address(this));
     }
 
+    // 同步更新tokenBalances[_token]，使其与当前本合约名下_token的余额取齐
     function _updateTokenBalance(address _token) private {
+        // 获取本合约名下的_token余额
         uint256 nextBalance = IERC20(_token).balanceOf(address(this));
+        // 更新tokenBalances[_token]为nextBalance
         tokenBalances[_token] = nextBalance;
     }
 
+    // 增加全局可用于开杠杆的_token的数量_amount
     function _increasePoolAmount(address _token, uint256 _amount) private {
+        // poolAmounts[_token]自增_amount
         poolAmounts[_token] = poolAmounts[_token].add(_amount);
+        // 本合约名下的_token数量
         uint256 balance = IERC20(_token).balanceOf(address(this));
+        // 要求增加后的开杠杆的_token的数量不可大于本合约名下的_token数量
         _validate(poolAmounts[_token] <= balance, 49);
+        // 抛出事件
         emit IncreasePoolAmount(_token, _amount);
     }
 
@@ -1195,12 +1399,17 @@ contract Vault is ReentrancyGuard, IVault {
         }
     }
 
+    // 增加为_token的产生的USDG债务，债务增量为_amount（以USDG计价）
     function _increaseUsdgAmount(address _token, uint256 _amount) private {
+        // 增加为_token的产生的USDG债务，债务增量为_amount
         usdgAmounts[_token] = usdgAmounts[_token].add(_amount);
+        // 获取允许为_token产生的USDG债务上限
         uint256 maxUsdgAmount = maxUsdgAmounts[_token];
         if (maxUsdgAmount != 0) {
+            // 如果债务上限不为0，那么要求增加债务后_token的债务不得大于该债务上限
             _validate(usdgAmounts[_token] <= maxUsdgAmount, 51);
         }
+        // 抛出事件
         emit IncreaseUsdgAmount(_token, _amount);
     }
 
@@ -1250,24 +1459,33 @@ contract Vault is ReentrancyGuard, IVault {
     }
 
     // we have this validation as a function instead of a modifier to reduce contract size
+    // 用于校验msg.sender是gov。之所以不用modifier是为了减小合约的字节码长度。
     function _onlyGov() private view {
+        // 要求msg.sender为gov，否则revert
         _validate(msg.sender == gov, 53);
     }
 
     // we have this validation as a function instead of a modifier to reduce contract size
+    // 用于检验msg.sender是否是manager（当合约进入manager模式时）
     function _validateManager() private view {
         if (inManagerMode) {
+            // 如果Vault合约处于manager模式下，要求msg.sender必须是在册的manager
             _validate(isManager[msg.sender], 54);
         }
     }
 
     // we have this validation as a function instead of a modifier to reduce contract size
+    // 防止交易给出过高的gas price（防MEV）
     function _validateGasPrice() private view {
+        // 如果全局的maxGasPrice为0，直接返回，即不做检查
         if (maxGasPrice == 0) {return;}
+        // 如果全局的maxGasPrice不为0，要求当前交易的gas price不可大于maxGasPrice，否则revert
         _validate(tx.gasprice <= maxGasPrice, 55);
     }
 
+    // 用于做校验的helper函数。_condition为要校验的条件判断布尔值，_errorCode为如果出现revert那么将返回的错误编号
     function _validate(bool _condition, uint256 _errorCode) private view {
+        // 要求_condition为true，否则revert并返回编号为_errorCode的error msg
         require(_condition, errors[_errorCode]);
     }
 }
