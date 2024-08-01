@@ -37,6 +37,7 @@ contract Vault is ReentrancyGuard, IVault {
     uint256 public constant MAX_FUNDING_RATE_FACTOR = 10000; // 1%
 
     bool public override isInitialized;
+    // 是否可以进行swap的开关
     bool public override isSwapEnabled = true;
     // 是否可以开杠杆的开关
     bool public override isLeverageEnabled = true;
@@ -59,14 +60,24 @@ contract Vault is ReentrancyGuard, IVault {
     uint256 public override maxLeverage = 50 * 10000; // 50x
 
     uint256 public override liquidationFeeUsd;
-    // 税费基点，即在动态手续费计算中，用于计算手续费减免和新增的基础基点
+    // 非稳定币之间swap时的税费基点，即在动态手续费计算中，用于计算手续费减免和新增的基础基点
     // 主网该值目前是60
     uint256 public override taxBasisPoints = 50; // 0.5%
+
+    // 稳定币之间swap时的税费基点，即在动态手续费计算中，用于计算手续费减免和新增的基础基点
+    // 主网该值目前是5
     uint256 public override stableTaxBasisPoints = 20; // 0.2%
+
     // buyUSDG和sellUSDG时，使用的手续费基点
     // 主网该值目前是25
     uint256 public override mintBurnFeeBasisPoints = 30; // 0.3%
+
+    // 非稳定币之间swap时，使用的手续费基点
+    // 主网该值目前是25
     uint256 public override swapFeeBasisPoints = 30; // 0.3%
+
+    // 稳定币之间swap时，使用的手续费基点
+    // 主网该值目前是1
     uint256 public override stableSwapFeeBasisPoints = 4; // 0.04%
     uint256 public override marginFeeBasisPoints = 10; // 0.1%
 
@@ -102,6 +113,7 @@ contract Vault is ReentrancyGuard, IVault {
     mapping(address => mapping(address => bool)) public override approvedRouters;
     mapping(address => bool) public override isLiquidator;
     // manager名单
+    // 注：目前在manager中，有GlpManager
     mapping(address => bool) public override isManager;
 
     // 所有添加过的白名单token列表（如果某token添加后又被移除了，那么该token也会存在于该列表中）
@@ -137,16 +149,19 @@ contract Vault is ReentrancyGuard, IVault {
 
     // poolAmounts tracks the number of received tokens that can be used for leverage
     // this is tracked separately from tokenBalances to exclude funds that are deposited as margin collateral
-    // token地址 -> 全局可用于开杠杆的该token的数量
+    // token地址 -> 全局可用于开杠杆头寸的该token的数量（可以理解为闲置的该token数量）
     // 注：poolAmounts与tokenBalances不一样，前者中不包含已抵押作为保证金的该token数量
     mapping(address => uint256) public override poolAmounts;
 
     // reservedAmounts tracks the number of tokens reserved for open leverage positions
     // token地址 -> 目前池中已用于开杠杆的该token数量（即锁定在未平仓杠杆头寸中的token数量）
+    // todo?
     mapping(address => uint256) public override reservedAmounts;
 
     // bufferAmounts allows specification of an amount to exclude from swaps
     // this can be used to ensure a certain amount of liquidity is available for leverage positions
+    // token地址 -> 用于支持杠杆头寸兑付的该token的该数量
+    // 注：这部分的token数量必须留存在Vault合约中，不允许被swap出去的
     mapping(address => uint256) public override bufferAmounts;
 
     // guaranteedUsd tracks the amount of USD that is "guaranteed" by opened leverage positions
@@ -319,8 +334,11 @@ contract Vault is ReentrancyGuard, IVault {
         isLiquidator[_liquidator] = _isActive;
     }
 
+    // gov管理swap的开关
     function setIsSwapEnabled(bool _isSwapEnabled) external override {
+        // 校验msg.sender是gov
         _onlyGov();
+        // 设置swap开关
         isSwapEnabled = _isSwapEnabled;
     }
 
@@ -445,7 +463,7 @@ contract Vault is ReentrancyGuard, IVault {
         totalTokenWeights = _totalTokenWeights.add(_tokenWeight);
 
         // validate price feed
-        // 获取一次_token的最大价格，用于验证_token价格的获取是否正常
+        // 获取一次_token的大价格，用于验证_token价格的获取是否正常
         getMaxPrice(_token);
     }
 
@@ -519,14 +537,23 @@ contract Vault is ReentrancyGuard, IVault {
 
     // deposit into the pool without minting USDG tokens
     // useful in allowing the pool to become over-collaterised
+    // 不增发USDG的情况下，向vault合约中直接注入_token
+    // 注：该方法是用来提升整个vault的质押率的
     function directPoolDeposit(address _token) external override nonReentrant {
+        // 要求注入的_token处于白名单中
         _validate(whitelistedTokens[_token], 14);
+        // 向本合约转移_token后，同步更新tokenBalances[_token]。本次注入的_token数量为tokenAmount
         uint256 tokenAmount = _transferIn(_token);
+        // 要求tokenAmount大于0
         _validate(tokenAmount > 0, 15);
+        // 注入的这部分_token直接增加到可用于开杠杆的_token的数量中
         _increasePoolAmount(_token, tokenAmount);
+        // 抛出事件
         emit DirectPoolDeposit(_token, tokenAmount);
     }
 
+    // 向Vault合约转入白名单中的_token，并将其换成等价值的USDG。这部分_token可以理解为向Vault添加流动性
+    // 注：在manager模式下，只有在册的manager（官方其他合约）才可以调用该函数
     function buyUSDG(address _token, address _receiver) external override nonReentrant returns (uint256) {
         // 检验msg.sender为在册的manager
         _validateManager();
@@ -535,7 +562,7 @@ contract Vault is ReentrancyGuard, IVault {
 
         // tokenAmount为转入vault合约的_token数量，即购买USDG的_token数量
         uint256 tokenAmount = _transferIn(_token);
-        // 要求转入_token数量不为0
+        // 要求转入_token数量大于0
         _validate(tokenAmount > 0, 17);
 
         // 更新_token的累计资金费率和最近一次更新资金费率的时间戳（如果当前距离上一次更新资金费率不到8小时，什么都不做）
@@ -568,7 +595,7 @@ contract Vault is ReentrancyGuard, IVault {
         // 增加为_token的产生的USDG债务，债务增量为_amount（以USDG计价）
         _increaseUsdgAmount(_token, mintAmount);
         // 增加全局可用于开杠杆的_token的数量，增量为扣除手续费后的_token数量
-        // 注：此时用户购买USDG的_token流向了两个地方：1. poolAmounts[_token] 2.feeReserves[_token]
+        // 注：至此，用户购买USDG的_token流向了两个地方：1. poolAmounts[_token] 2.feeReserves[_token]
         _increasePoolAmount(_token, amountAfterFees);
         // 为_receiver增发mintAmount数量的USDG
         IUSDG(usdg).mint(_receiver, mintAmount);
@@ -581,91 +608,138 @@ contract Vault is ReentrancyGuard, IVault {
         return mintAmount;
     }
 
+    // 向Vault合约转入usdg，并将其换成等价值的_token。这部分_token可以理解为从Vault中减少的流动性
+    // 注：在manager模式下，只有在册的manager（官方其他合约）才可以调用该函数
     function sellUSDG(address _token, address _receiver) external override nonReentrant returns (uint256) {
+        // 检验msg.sender为在册的manager
         _validateManager();
+        // 检验_token为在册白名单token
         _validate(whitelistedTokens[_token], 19);
+        // 标志位useSwapPricing设置为true（该标志位实际上无作用，可以删除）
         useSwapPricing = true;
 
+        // usdgAmount为转入vault合约的USDG数量，即卖出的USDG数量
         uint256 usdgAmount = _transferIn(usdg);
+        // 要求转入USDG数量不为0
         _validate(usdgAmount > 0, 20);
 
+        // 更新_token的累计资金费率和最近一次更新资金费率的时间戳（如果当前距离上一次更新资金费率不到8小时，什么都不做）
         updateCumulativeFundingRate(_token);
 
+        // redemptionAmount为当前_usdgAmount数量的USDG可以兑换的_token数量
         uint256 redemptionAmount = getRedemptionAmount(_token, usdgAmount);
+        // 要求可兑换_token数量大于0
         _validate(redemptionAmount > 0, 21);
 
+        // 减少为_token的产生的USDG债务，债务减量为usdgAmount
         _decreaseUsdgAmount(_token, usdgAmount);
+        // 减少全局可用于开杠杆的_token的数量redemptionAmount
         _decreasePoolAmount(_token, redemptionAmount);
-
+        // 销毁本合约名下数量为usdgAmount的USDG
         IUSDG(usdg).burn(address(this), usdgAmount);
 
-        // the _transferIn call increased the value of tokenBalances[usdg]
-        // usually decreases in token balances are synced by calling _transferOut
-        // however, for usdg, the tokens are burnt, so _updateTokenBalance should
-        // be manually called to record the decrease in tokens
+        // 由于上一步已经销毁了本合约名下数量为usdgAmount的USDG，所以这里调用{_updateTokenBalance}来同步取齐tokenBalances[usdg]
         _updateTokenBalance(usdg);
 
+        // 根据为_token减少的USDG债务数量，计算卖出USDG要花费的手续费基点
+        // 注：减少债务数量为usdgAmount，使用的基础手续费为mintBurnFeeBasisPoints，动态手续费减免或新增的基础基点为taxBasisPoints
         uint256 feeBasisPoints = getFeeBasisPoints(_token, usdgAmount, mintBurnFeeBasisPoints, taxBasisPoints, false);
+        // 收swap的手续费，amountOuts为扣除手续费后的_token数量
         uint256 amountOut = _collectSwapFees(_token, redemptionAmount, feeBasisPoints);
+        // 要求扣除手续费后的_token数量不大于0
         _validate(amountOut > 0, 22);
 
+        // 从本合约转移数量为amountOut的_token转移给_receiver
         _transferOut(_token, amountOut, _receiver);
-
+        // 抛出事件
         emit SellUSDG(_receiver, _token, usdgAmount, amountOut, feeBasisPoints);
-
+        // 标志位useSwapPricing设置为false（该标志位实际上无作用，可以删除）
         useSwapPricing = false;
+        // 返回最终转移给_receiver的_token数量
         return amountOut;
     }
 
+    // 向Vault合约转入_tokenIn，并将其换成等价值的_tokenOut给_receiver
+    // 注：swap的手续费收的是_tokenOut
     function swap(address _tokenIn, address _tokenOut, address _receiver) external override nonReentrant returns (uint256) {
+        // 要求swap的开关已打开
         _validate(isSwapEnabled, 23);
+        // 要求_tokenIn和tokenOut都是在册白名单token
         _validate(whitelistedTokens[_tokenIn], 24);
         _validate(whitelistedTokens[_tokenOut], 25);
+        // 要求_tokenIn和_tokenOut不是同一个token地址
         _validate(_tokenIn != _tokenOut, 26);
-
+        // 标志位useSwapPricing设置为true（该标志位实际上无作用，可以删除）
         useSwapPricing = true;
 
+        // 更新_tokenIn的累计资金费率和最近一次更新资金费率的时间戳（如果当前距离上一次更新资金费率不到8小时，什么都不做）
         updateCumulativeFundingRate(_tokenIn);
+        // 更新_tokenOut的累计资金费率和最近一次更新资金费率的时间戳（如果当前距离上一次更新资金费率不到8小时，什么都不做）
         updateCumulativeFundingRate(_tokenOut);
 
+        // amountIn为转入vault合约的_tokenIn数量，即用于兑换_tokenOut的_tokenIn数量
         uint256 amountIn = _transferIn(_tokenIn);
+        // 要求转入_token数量大于0
         _validate(amountIn > 0, 27);
 
+        // priceIn为获取的_tokenIn的小价格（decimal为30）
         uint256 priceIn = getMinPrice(_tokenIn);
+        // priceOut为获取的_tokenOut的小价格（decimal为30）
         uint256 priceOut = getMaxPrice(_tokenOut);
 
+        // amountOut为：转入_tokenIn数量 * _tokenIn价格 / priceOut
+        // 注：此时amountOut带有_tokenIn的精度
         uint256 amountOut = amountIn.mul(priceIn).div(priceOut);
+        // 从amountOut中去除_tokenIn精度，加入_tokenOut精度
         amountOut = adjustForDecimals(amountOut, _tokenIn, _tokenOut);
 
         // adjust usdgAmounts by the same usdgAmount as debt is shifted between the assets
+        // usdgAmount为转入_tokenIn的USDG价值，即转入_tokenIn数量 * _tokenIn价格 / _tokenIn价格所带的价格精度
+        // 注：此时usdgAmount带有_tokenIn精度
         uint256 usdgAmount = amountIn.mul(priceIn).div(PRICE_PRECISION);
+        // 从amountOut中去除_tokenIn精度，加入USDG精度
         usdgAmount = adjustForDecimals(usdgAmount, _tokenIn, usdg);
 
+        // 如果_tokenIn和_tokenOut都是稳定币，isStableSwap为true。否则为false
         bool isStableSwap = stableTokens[_tokenIn] && stableTokens[_tokenOut];
         uint256 feeBasisPoints;
         {
+            // 如果是稳定币之间的swap，手续费基点为stableSwapFeeBasisPoints；否则为swapFeeBasisPoints
             uint256 baseBps = isStableSwap ? stableSwapFeeBasisPoints : swapFeeBasisPoints;
+            // 如果是稳定币之间的swap，税费基点为stableTaxBasisPoints；否则为taxBasisPoints
             uint256 taxBps = isStableSwap ? stableTaxBasisPoints : taxBasisPoints;
+            // 计算为_tokenIn增加usdgAmount数量的债务时的手续费基点feesBasisPoints0
             uint256 feesBasisPoints0 = getFeeBasisPoints(_tokenIn, usdgAmount, baseBps, taxBps, true);
+            // 计算为_tokenOut减少usdgAmount数量的债务时的手续费基点feesBasisPoints1
             uint256 feesBasisPoints1 = getFeeBasisPoints(_tokenOut, usdgAmount, baseBps, taxBps, false);
             // use the higher of the two fee basis points
+            // feesBasisPoints0和feesBasisPoints1中取大值作为本次swap的手续费基点
             feeBasisPoints = feesBasisPoints0 > feesBasisPoints1 ? feesBasisPoints0 : feesBasisPoints1;
         }
+
+        // 收swap手续费，amountOutAfterFees为扣除手续费后的_token数量
         uint256 amountOutAfterFees = _collectSwapFees(_tokenOut, amountOut, feeBasisPoints);
 
+        // 增加为_tokenIn的产生的USDG债务，债务增量为usdgAmount（以USDG计价）
         _increaseUsdgAmount(_tokenIn, usdgAmount);
+        // 减少为_tokenOut的产生的USDG债务，债务减量为usdgAmount
         _decreaseUsdgAmount(_tokenOut, usdgAmount);
 
+        // 增加全局可用于开杠杆的_tokenIn的数量，增量为转入本合约的_tokenIn的数量
+        // 注：至此，转入的_tokenIn流向只流向一个地方 poolAmounts[_tokenIn]
         _increasePoolAmount(_tokenIn, amountIn);
+        // 减少全局可用于开杠杆的_tokenOut的数量，减量为amountOut
         _decreasePoolAmount(_tokenOut, amountOut);
-
+        // 对_tokenOut进行现有杠杆头寸的可对付检查，保证swap后Vault中有足够的闲置_tokenOut来兑付全部_tokenOut的杠杆头寸
         _validateBufferAmount(_tokenOut);
 
+        // 从本合约转移数量为amountOutAfterFees的_tokenOut转移给_receiver
         _transferOut(_tokenOut, amountOutAfterFees, _receiver);
-
+        // 抛出事件
         emit Swap(_receiver, _tokenIn, _tokenOut, amountIn, amountOut, amountOutAfterFees, feeBasisPoints);
-
+        // 标志位useSwapPricing设置为false（该标志位实际上无作用，可以删除）
         useSwapPricing = false;
+        // 返回最终转移给_receiver的_tokenOut数量
         return amountOutAfterFees;
     }
 
@@ -895,17 +969,27 @@ contract Vault is ReentrancyGuard, IVault {
         return (0, marginFees);
     }
 
+    // 获取_token的大价格（decimal为30）
     function getMaxPrice(address _token) public override view returns (uint256) {
+        // 调用VaultPriceFeed合约的{getPrice}方法来获取_token的大价格
         return IVaultPriceFeed(priceFeed).getPrice(_token, true, includeAmmPrice, useSwapPricing);
     }
 
+    // 获取_token的小价格（decimal为30）
     function getMinPrice(address _token) public override view returns (uint256) {
+        // 调用VaultPriceFeed合约的{getPrice}方法来获取_token的小价格
         return IVaultPriceFeed(priceFeed).getPrice(_token, false, includeAmmPrice, useSwapPricing);
     }
 
+    // 计算当前_usdgAmount数量的USDG可以兑换的_token数量
+    // 注：返回值携带_token精度
     function getRedemptionAmount(address _token, uint256 _usdgAmount) public override view returns (uint256) {
+        // 获取_token当前的大价格（带价格精度）
         uint256 price = getMaxPrice(_token);
+        // 计算以price作为单价，_usdgAmount可以兑换成_token的数量
+        // 即 _usdgAmount * 价格精度 / price，计算结果是带USDG精度的
         uint256 redemptionAmount = _usdgAmount.mul(PRICE_PRECISION).div(price);
+        // 将redemptionAmount去除USDG精度并加入_token的精度
         return adjustForDecimals(redemptionAmount, usdg, _token);
     }
 
@@ -1147,7 +1231,7 @@ contract Vault is ReentrancyGuard, IVault {
     // 7. initialAmount is above targetAmount, nextAmount is below targetAmount and vice versa
     // 8. a large swap should have similar fees as the same trade split into multiple smaller swaps
 
-    // 获取手续费基点
+    // 计算改变_token的债务时的手续费基点
     // 参数：
     // - _token：目标token；
     // - _usdgDelta：USDG债务的改变量；
@@ -1381,19 +1465,27 @@ contract Vault is ReentrancyGuard, IVault {
         poolAmounts[_token] = poolAmounts[_token].add(_amount);
         // 本合约名下的_token数量
         uint256 balance = IERC20(_token).balanceOf(address(this));
-        // 要求增加后的开杠杆的_token的数量不可大于本合约名下的_token数量
+        // 要求增加后的可用于开杠杆的_token的数量不可大于本合约名下的_token数量
         _validate(poolAmounts[_token] <= balance, 49);
         // 抛出事件
         emit IncreasePoolAmount(_token, _amount);
     }
 
+    // 减少全局可用于开杠杆的_token的数量_amount
     function _decreasePoolAmount(address _token, uint256 _amount) private {
+        // poolAmounts[_token]自减_amount
         poolAmounts[_token] = poolAmounts[_token].sub(_amount, "Vault: poolAmount exceeded");
+        // 要求减少后的可用于开杠杆的_token的数量不可小于目前池中已用于开杠杆的该token数量
+        // todo ??
         _validate(reservedAmounts[_token] <= poolAmounts[_token], 50);
+        // 抛出事件
         emit DecreasePoolAmount(_token, _amount);
     }
 
+    // 对_token进行现有杠杆头寸的可兑付检查
     function _validateBufferAmount(address _token) private view {
+        // 要求此时的 可用于开杠杆头寸的_tokenOut数量 >= 支持杠杆头寸兑付的_tokenOut数量
+        // 如果poolAmounts[_token] < bufferAmounts[_token]，可能导致现有的杠杆头寸平仓后无法对付
         if (poolAmounts[_token] < bufferAmounts[_token]) {
             revert("Vault: poolAmount < buffer");
         }
@@ -1413,17 +1505,25 @@ contract Vault is ReentrancyGuard, IVault {
         emit IncreaseUsdgAmount(_token, _amount);
     }
 
+    // 减少为_token的产生的USDG债务，债务减量为_amount（以USDG计价）
     function _decreaseUsdgAmount(address _token, uint256 _amount) private {
+        // 获取当前为_token的产生的USDG债务
         uint256 value = usdgAmounts[_token];
-        // since USDG can be minted using multiple assets
-        // it is possible for the USDG debt for a single asset to be less than zero
-        // the USDG debt is capped to zero for this case
+        // 因为USDG可以通过白名单中的所有token来铸造，那么某个单一资产的债务有可能会小于0。比如：全部USDG通过BTC来mint，但是偏要用USDT来赎回
+        // 所以当出现负债务的时候，直接将债务下限设为0
         if (value <= _amount) {
+            // 如果减少量大于等于当前为_token的产生的USDG债务
+            // 直接将为_token的产生的USDG债务清0
             usdgAmounts[_token] = 0;
+            // 抛出事件
             emit DecreaseUsdgAmount(_token, value);
+            // 返回
             return;
         }
+        // 如果减少量小于当前为_token的产生的USDG债务
+        // _token的债务减去债务减少量
         usdgAmounts[_token] = value.sub(_amount);
+        // 抛出事件
         emit DecreaseUsdgAmount(_token, _amount);
     }
 
