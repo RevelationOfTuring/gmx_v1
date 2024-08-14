@@ -13,18 +13,28 @@ contract Vault is ReentrancyGuard, IVault {
     using SafeMath for uint256;
     using SafeERC20 for IERC20;
 
+    // 仓位信息
     struct Position {
+        // 仓位大小（以USD计价，带价格精度30）
         uint256 size;
+        // 每次加仓时，投入到本仓位中的抵押token的价值的累计和（以USD计价，带价格精度30）
         uint256 collateral;
+        // 当前的仓位均价
         uint256 averagePrice;
+        // 最近一次改变仓位大小时的累计资金费率
         uint256 entryFundingRate;
+        // 每次加仓时，本仓位的仓位增量对应的抵押token的数量累计和
+        // 注：reserveAmount的作用是用于兑付未来本仓位的盈利
         uint256 reserveAmount;
         int256 realisedPnl;
+        // 最近一次加仓的时间戳
         uint256 lastIncreasedTime;
     }
 
     // 基点分母，即合约中1基点表示原数值的万分之1
     uint256 public constant BASIS_POINTS_DIVISOR = 10000;
+    // 资金费率的精度
+    // 注：如果某仓位的资金费率为100，那么意味着的资金费是：100 * 仓位大小 / FUNDING_RATE_PRECISION
     uint256 public constant FUNDING_RATE_PRECISION = 1000000;
     // 从VaultPriceFeed合约获得的价格所携带的价格精度
     uint256 public constant PRICE_PRECISION = 10 ** 30;
@@ -40,6 +50,7 @@ contract Vault is ReentrancyGuard, IVault {
     // 是否可以进行swap的开关
     bool public override isSwapEnabled = true;
     // 是否可以开杠杆的开关
+    // 注：该开关直接控制{increasePosition}函数
     bool public override isLeverageEnabled = true;
 
     // 具有修改mapping {errors}内容权限的地址，即VaultErrorController合约地址
@@ -57,8 +68,11 @@ contract Vault is ReentrancyGuard, IVault {
     // token白名单中的token个数，即可以做流动性的token个数
     uint256 public override whitelistedTokenCount;
 
+    // 杠杆数上限
+    // 主网该值目前是100*10000，即100x
     uint256 public override maxLeverage = 50 * 10000; // 50x
 
+    //
     uint256 public override liquidationFeeUsd;
     // 非稳定币之间swap时的税费基点，即在动态手续费计算中，用于计算手续费减免和新增的基础基点
     // 主网该值目前是60
@@ -79,8 +93,17 @@ contract Vault is ReentrancyGuard, IVault {
     // 稳定币之间swap时，使用的手续费基点
     // 主网该值目前是1
     uint256 public override stableSwapFeeBasisPoints = 4; // 0.04%
+    // 保证金手续费基点
+    // 主网该值目前是40
     uint256 public override marginFeeBasisPoints = 10; // 0.1%
 
+    // 触发最小盈利阈值机制的间隔时长
+    // 注：用于防止front-running（提前交易）的问题。抢跑机器人一般会通过监听pending pool做高频的抢跑操作，从而盈利。
+    // 所以抢跑机器人往往会对于相同的标的token进行高频的加减仓操作。引入minProfitTime的限制后，针对`盈利仓位`的以下操作，在计算收益时会加入最小盈利阈值限制：
+    // 1. 加仓后短时间内减仓；
+    // 2. 加仓后短时间内连续加仓；
+    // 如果`本次盈利价值占总仓位大小的比例`不大于minProfitBasisPoints[_indexToken]，系统会认为其仓位未盈利。至此，那些高频的微盈利操作均得到了限制
+    // 主网该值目前是10800，即3 hours
     uint256 public override minProfitTime;
     // 计算手续费时使用动态手续费的开关
     // 主网该值目前是true
@@ -102,7 +125,7 @@ contract Vault is ReentrancyGuard, IVault {
     // 从VaultPriceFeed合约获得的价格时携带的一个参数标志位，但是在VaultPrinceFeed合约的{getPrice}方法的具体实现中并未真正使用到该参数
     bool public useSwapPricing = false;
 
-    // vault合约进入manager模式的开关
+    // Vault合约进入manager模式的开关
     // 注：在manager模式下，{buyUSDG}和{sellUSDG}只有manager才可以调用。目前线上Vault合约是处于manager模式。
     bool public override inManagerMode = false;
     bool public override inPrivateLiquidationMode = false;
@@ -110,6 +133,8 @@ contract Vault is ReentrancyGuard, IVault {
     // 合约接受交易的gqs price上限，用于防MEV
     uint256 public override maxGasPrice;
 
+    // key1的已授权的router名单。key2为key1的授权router地址，value2为key2当前是否已得到key1的授权
+    // 注：如果key2得到了key1的授权，那么key2就可以操作key1的仓位（加仓+减仓）。且router合约默认是所有人// todo
     mapping(address => mapping(address => bool)) public override approvedRouters;
     mapping(address => bool) public override isLiquidator;
     // manager名单
@@ -124,10 +149,13 @@ contract Vault is ReentrancyGuard, IVault {
     // token地址 -> 该token的decimals
     mapping(address => uint256) public override tokenDecimals;
     // token地址 -> 该token最小的盈利基点
+    // 即当该token作为标的token时，计算仓位盈亏情况时
+    // 目前主网该mapping的所有值都是0，即不开启最小盈利阈值限制
     mapping(address => uint256) public override minProfitBasisPoints;
     // token地址 -> 该token是否是稳定币
     mapping(address => bool) public override stableTokens;
     // token地址 -> 该token是否可以做空
+    // 即该token是否可以作为加空仓的标的token
     mapping(address => bool) public override shortableTokens;
 
     // tokenBalances is used only to determine _transferIn values
@@ -160,7 +188,7 @@ contract Vault is ReentrancyGuard, IVault {
 
     // bufferAmounts allows specification of an amount to exclude from swaps
     // this can be used to ensure a certain amount of liquidity is available for leverage positions
-    // token地址 -> 用于支持杠杆头寸兑付的该token的该数量
+    // token地址 -> 必须留存在本合约中该token的最小数量
     // 注：这部分的token数量必须留存在Vault合约中，不允许被swap出去的
     mapping(address => uint256) public override bufferAmounts;
 
@@ -179,6 +207,8 @@ contract Vault is ReentrancyGuard, IVault {
     mapping(address => uint256) public override lastFundingTimes;
 
     // positions tracks all open positions
+    // 仓位列表
+    // position key -> 仓位信息
     mapping(bytes32 => Position) public positions;
 
     // feeReserves tracks the amount of fees per token
@@ -190,7 +220,11 @@ contract Vault is ReentrancyGuard, IVault {
     // 4.
     mapping(address => uint256) public override feeReserves;
 
+    // token地址 -> 全局以该token作为标的token的全部空仓的仓位大小之和
+    // 注：key应为非稳定币
     mapping(address => uint256) public override globalShortSizes;
+    // token地址 -> 全局以该token作为标的token的全部空仓的仓位均价
+    // 注：key应为非稳定币
     mapping(address => uint256) public override globalShortAveragePrices;
 
     mapping(uint256 => string) public errors;
@@ -421,7 +455,7 @@ contract Vault is ReentrancyGuard, IVault {
         uint256 _tokenDecimals,
     // 目标token权重
         uint256 _tokenWeight,
-    // 目标token的最小盈利基点
+    // 目标token的最小盈利阈值基点
         uint256 _minProfitBps,
     // 允许为目标token产生的最大USDG债务
         uint256 _maxUsdgAmount,
@@ -451,7 +485,7 @@ contract Vault is ReentrancyGuard, IVault {
         tokenDecimals[_token] = _tokenDecimals;
         // 记录_token的权重
         tokenWeights[_token] = _tokenWeight;
-        // 记录_token的最小盈利基点
+        // 记录_token的最小盈利阈值基点
         minProfitBasisPoints[_token] = _minProfitBps;
         // 记录允许为_token产生的USDG债务上限
         maxUsdgAmounts[_token] = _maxUsdgAmount;
@@ -481,7 +515,7 @@ contract Vault is ReentrancyGuard, IVault {
         delete tokenDecimals[_token];
         // 删除合约中记录的_token权重
         delete tokenWeights[_token];
-        // 删除合约中记录的_token最小盈利基点
+        // 删除合约中记录的_token最小盈利阈值基点
         delete minProfitBasisPoints[_token];
         // 删除合约中记录的允许为_token产生的USDG债务上限
         delete maxUsdgAmounts[_token];
@@ -509,10 +543,12 @@ contract Vault is ReentrancyGuard, IVault {
         return amount;
     }
 
+    // 为自己增添授权的Router地址_router
     function addRouter(address _router) external {
         approvedRouters[msg.sender][_router] = true;
     }
 
+    // 为自己移除授权的Router地址_router
     function removeRouter(address _router) external {
         approvedRouters[msg.sender][_router] = false;
     }
@@ -537,7 +573,7 @@ contract Vault is ReentrancyGuard, IVault {
 
     // deposit into the pool without minting USDG tokens
     // useful in allowing the pool to become over-collaterised
-    // 不增发USDG的情况下，向vault合约中直接注入_token
+    // 不增发USDG的情况下，向Vault合约中直接注入_token
     // 注：该方法是用来提升整个vault的质押率的
     function directPoolDeposit(address _token) external override nonReentrant {
         // 要求注入的_token处于白名单中
@@ -560,7 +596,7 @@ contract Vault is ReentrancyGuard, IVault {
         // 检验_token为在册白名单token
         _validate(whitelistedTokens[_token], 16);
 
-        // tokenAmount为转入vault合约的_token数量，即购买USDG的_token数量
+        // tokenAmount为转入Vault合约的_token数量，即购买USDG的_token数量
         uint256 tokenAmount = _transferIn(_token);
         // 要求转入_token数量大于0
         _validate(tokenAmount > 0, 17);
@@ -618,7 +654,7 @@ contract Vault is ReentrancyGuard, IVault {
         // 标志位useSwapPricing设置为true（该标志位实际上无作用，可以删除）
         useSwapPricing = true;
 
-        // usdgAmount为转入vault合约的USDG数量，即卖出的USDG数量
+        // usdgAmount为转入Vault合约的USDG数量，即卖出的USDG数量
         uint256 usdgAmount = _transferIn(usdg);
         // 要求转入USDG数量不为0
         _validate(usdgAmount > 0, 20);
@@ -677,14 +713,14 @@ contract Vault is ReentrancyGuard, IVault {
         // 更新_tokenOut的累计资金费率和最近一次更新资金费率的时间戳（如果当前距离上一次更新资金费率不到8小时，什么都不做）
         updateCumulativeFundingRate(_tokenOut);
 
-        // amountIn为转入vault合约的_tokenIn数量，即用于兑换_tokenOut的_tokenIn数量
+        // amountIn为转入Vault合约的_tokenIn数量，即用于兑换_tokenOut的_tokenIn数量
         uint256 amountIn = _transferIn(_tokenIn);
         // 要求转入_token数量大于0
         _validate(amountIn > 0, 27);
 
         // priceIn为获取的_tokenIn的小价格（decimal为30）
         uint256 priceIn = getMinPrice(_tokenIn);
-        // priceOut为获取的_tokenOut的小价格（decimal为30）
+        // priceOut为获取的_tokenOut的大价格（decimal为30）
         uint256 priceOut = getMaxPrice(_tokenOut);
 
         // amountOut为：转入_tokenIn数量 * _tokenIn价格 / priceOut
@@ -743,48 +779,81 @@ contract Vault is ReentrancyGuard, IVault {
         return amountOutAfterFees;
     }
 
+    // 进行开仓或加仓
+    // 参数：
+    // - _account：仓位持有人地址；
+    // - _collateralToken：抵押token地址；
+    // - _indexToken：标的token地址；
+    // - _sizeDelta：仓位改变的增量（以USD计价，并带价格精度30）
+    // - _isLong：true为加多仓，false为加空仓
     function increasePosition(address _account, address _collateralToken, address _indexToken, uint256 _sizeDelta, bool _isLong) external override nonReentrant {
+        // 要求可以开杠杆的开关是被打开状态
         _validate(isLeverageEnabled, 28);
+        // 防止交易给出过高的gas price（防MEV）
         _validateGasPrice();
+        // 检查当前msg.sender与被操作账户_account的关系
         _validateRouter(_account);
+        // 对抵押token和标的token做的相关校验
         _validateTokens(_collateralToken, _indexToken, _isLong);
+        // 更新抵押token的累计资金费率和最近一次更新资金费率的时间戳（如果当前距离上一次更新资金费率不到8小时，什么都不做）
         updateCumulativeFundingRate(_collateralToken);
 
+        // 计算本仓位的key
         bytes32 key = getPositionKey(_account, _collateralToken, _indexToken, _isLong);
+        // 获取仓位key对应的storage指针，指向仓位信息
+        // 注：如果不存在对应仓位（即开仓），则position的所有成员值均为0
         Position storage position = positions[key];
 
+        // 获取当前标的token价格。如果是做多，取标的token的大价格；如果是做空，取标的token的小价格
         uint256 price = _isLong ? getMaxPrice(_indexToken) : getMinPrice(_indexToken);
-
         if (position.size == 0) {
+            // 如果是开仓操作（即第一次加仓），仓位的均价为price
             position.averagePrice = price;
         }
 
         if (position.size > 0 && _sizeDelta > 0) {
+            // 如果是加仓（之前已有仓位大小）且加仓量大于0
+            // 更新加仓后的仓位均价
             position.averagePrice = getNextAveragePrice(_indexToken, position.size, position.averagePrice, _isLong, price, _sizeDelta, position.lastIncreasedTime);
         }
 
+        // 收取margin fee（以USD计价，并带价格精度30）
+        // margin fee为position fee + 资金费，这两部分费用均是以USD计价。最后会将margin fee折算成抵押token来收取
         uint256 fee = _collectMarginFees(_collateralToken, _sizeDelta, position.size, position.entryFundingRate);
+        // collateralDelta为新转入Vault合约的新增抵押token数量
         uint256 collateralDelta = _transferIn(_collateralToken);
+        // 计算刚转入Vault合约的抵押token的USD价值（带价格精度30）
         uint256 collateralDeltaUsd = tokenToUsdMin(_collateralToken, collateralDelta);
 
+        // 仓位信息中的抵押token的累计价值自增collateralDeltaUsd
         position.collateral = position.collateral.add(collateralDeltaUsd);
+        // 要求仓位的抵押token累计价值不小于当前的margin fee
         _validate(position.collateral >= fee, 29);
-
+        // 从仓位信息中的抵押token的累计价值中扣除margin fee
         position.collateral = position.collateral.sub(fee);
+        // 仓位信息中最近一次改变仓位大小时的累计资金费率 更新为 当前抵押token的累计资金费率
         position.entryFundingRate = cumulativeFundingRates[_collateralToken];
+        // 仓位信息中的仓位大小自增_sizeDelta
         position.size = position.size.add(_sizeDelta);
+        // 仓位信息中的最近一次加仓的时间戳更新为当前时间戳
         position.lastIncreasedTime = block.timestamp;
-
+        // 要求加仓后仓位大小大于0
         _validate(position.size > 0, 30);
+        // 做仓位检查
         _validatePosition(position.size, position.collateral);
+        // 验证仓位加仓后不会触发清算。如果会触发清算 或 仓位杠杆数超过上限，会直接revert
         validateLiquidation(_account, _collateralToken, _indexToken, _isLong, true);
 
         // reserve tokens to pay profits on the position
+        // reserveDelta为：以抵押token的小价格做为单价，将 仓位改变的增量 兑换为抵押token的数量
+        // 即本次加仓导致reserveAmount的改变量
         uint256 reserveDelta = usdToTokenMax(_collateralToken, _sizeDelta);
+        // 本仓位的仓位大小对应的抵押token累计数量自增reserveDelta
         position.reserveAmount = position.reserveAmount.add(reserveDelta);
         _increaseReservedAmount(_collateralToken, reserveDelta);
 
         if (_isLong) {
+            // 如果是加仓多仓
             // guaranteedUsd stores the sum of (position.size - position.collateral) for all positions
             // if a fee is charged on the collateral then guaranteedUsd should be increased by that fee amount
             // since (position.size - position.collateral) would have increased by `fee`
@@ -796,14 +865,19 @@ contract Vault is ReentrancyGuard, IVault {
             // and collateral is treated as part of the pool
             _decreasePoolAmount(_collateralToken, usdToTokenMin(_collateralToken, fee));
         } else {
+            // 如果是加仓空仓
             if (globalShortSizes[_indexToken] == 0) {
+                // 如果当前全局没有做空该标的token仓位，那么将全局做空该标的token的全部空仓均价设置为price
                 globalShortAveragePrices[_indexToken] = price;
             } else {
+                // 如果当前全局已有做空该标的token仓位，那么更新全局做空该标的token的全部空仓均价
                 globalShortAveragePrices[_indexToken] = getNextGlobalShortAveragePrice(_indexToken, price, _sizeDelta);
             }
+            // 全局做空该标的token仓位 自增 本次加空仓的仓位改变量
             globalShortSizes[_indexToken] = globalShortSizes[_indexToken].add(_sizeDelta);
         }
 
+        // 抛出事件
         emit IncreasePosition(key, _account, _collateralToken, _indexToken, collateralDeltaUsd, _sizeDelta, _isLong, price, fee);
         emit UpdatePosition(key, position.size, position.collateral, position.averagePrice, position.entryFundingRate, position.reserveAmount, position.realisedPnl);
     }
@@ -883,6 +957,8 @@ contract Vault is ReentrancyGuard, IVault {
         }
 
         // set includeAmmPrice to false prevent manipulated liquidations
+        // 关闭获取抵押token价格时参考amm价格
+        // 这是防止在进行清算时，通过闪电贷操控amm价格进而实现对仓位清算的操控
         includeAmmPrice = false;
 
         updateCumulativeFundingRate(_collateralToken);
@@ -932,40 +1008,80 @@ contract Vault is ReentrancyGuard, IVault {
     }
 
     // validateLiquidation returns (state, fees)
+    // 验证当前仓位是否可清算。返回值有两个：1. 清算状态；2. 该仓位遭清算时可支付的起margin fee
+    // 注：清算状态码含义。
+    // - 状态0：该仓位不需要清算；
+    // - 状态1：该仓位需要清算；
+    // - 状态2：该仓位不需要被清算，但本仓位的杠杆数已超上限。
+    // 参数：
+    // - _account：持有该仓位的地址；
+    // - _collateralToken：抵押token地址；
+    // - _indexToken：标的token地址；
+    // - _isLong：true为多仓，false为空仓；
+    // - _raise：当清算状态出现非0状态时，是否引发revert。
     function validateLiquidation(address _account, address _collateralToken, address _indexToken, bool _isLong, bool _raise) public view returns (uint256, uint256) {
+        // 计算仓位key
         bytes32 key = getPositionKey(_account, _collateralToken, _indexToken, _isLong);
+        // 获取仓位key对应的storage指针，指向仓位信息
         Position memory position = positions[key];
 
+        // 计算目前该仓位的盈亏情况
         (bool hasProfit, uint256 delta) = getDelta(_indexToken, position.size, position.averagePrice, _isLong, position.lastIncreasedTime);
+        // 计算目前该仓位目前产生的margin fee
+        // 注：margin fee由资金费和position fee组成
         uint256 marginFees = getFundingFee(_collateralToken, position.size, position.entryFundingRate);
+        // 此处涉及的position fee部分为：仓位改变量为整个仓位时产生的position fee
         marginFees = marginFees.add(getPositionFee(position.size));
 
         if (!hasProfit && position.collateral < delta) {
+            // 如果该仓位目前处于亏损状态 且 亏损 大于 该仓位的抵押token的累计价值，说明此时已资不抵债
+            // 如果_raise为true，则直接revert
             if (_raise) {revert("Vault: losses exceed collateral");}
+            // 如果_raise为false，返回状态1和margin fee
             return (1, marginFees);
         }
 
+        // 注：到此说明该仓位的抵押token的累计价值还能cover住亏损（如果仓位产生亏损的话）
+
+        // remainingCollateral为该仓位的抵押token的累计价值
         uint256 remainingCollateral = position.collateral;
         if (!hasProfit) {
+            // 如果该仓位目前处于亏损状态
+            // 从remainingCollateral中减去亏损价值
             remainingCollateral = position.collateral.sub(delta);
         }
 
+        // 如果仓位盈利，则remainingCollateral不变（无亏损）
+
         if (remainingCollateral < marginFees) {
+            // 如果扣除亏损后的remainingCollateral不足以支付margin fee
+            // 如果_raise为true，则直接revert
             if (_raise) {revert("Vault: fees exceed collateral");}
+
             // cap the fees to the remainingCollateral
+            // 如果_raise为false，直接返回状态1和remainingCollateral
+            // 即remainingCollateral直接全部充当margin fee
             return (1, remainingCollateral);
         }
 
         if (remainingCollateral < marginFees.add(liquidationFeeUsd)) {
+            // 如果扣除亏损后的remainingCollateral足以支付margin fee，但是不足以再支付额外的清算fee时
+            // 如果_raise为true，则直接revert
             if (_raise) {revert("Vault: liquidation fees exceed collateral");}
+            // 如果_raise为false，直接返回状态1和margin fee
             return (1, marginFees);
         }
 
         if (remainingCollateral.mul(maxLeverage) < position.size.mul(BASIS_POINTS_DIVISOR)) {
+            // 如果扣除亏损后的remainingCollateral足以支付margin fee + 清算fee
+            // 但总仓位大小 已经大于 扣除亏损后的remainingCollateral * 最大杠杆数，即本仓位的杠杆数已超杠杆上限
+            // 如果_raise为true，则直接revert
             if (_raise) {revert("Vault: maxLeverage exceeded");}
+            // 如果_raise为false，直接返回状态2和margin fee
             return (2, marginFees);
         }
 
+        // 至此，返回状态0和margin fee。即本仓位不需要清算
         return (0, marginFees);
     }
 
@@ -1030,22 +1146,36 @@ contract Vault is ReentrancyGuard, IVault {
         return _tokenAmount.mul(price).div(10 ** decimals);
     }
 
+    // 以_token的小价格作为单价，计算美元价值为_usdAmount的_token的数量。
+    // 注：_usdAmount带价格精度30
     function usdToTokenMax(address _token, uint256 _usdAmount) public view returns (uint256) {
+        // 如果美元价值为0，直接返回0
         if (_usdAmount == 0) {return 0;}
+        // 以_token的小价格作为单价，计算美元价值为_usdAmount的_token的数量
         return usdToToken(_token, _usdAmount, getMinPrice(_token));
     }
 
+    // 以_token的大价格作为单价，计算美元价值为_usdAmount的_token的数量。
+    // 注：_usdAmount带价格精度30
     function usdToTokenMin(address _token, uint256 _usdAmount) public view returns (uint256) {
+        // 如果美元价值为0，直接返回0
         if (_usdAmount == 0) {return 0;}
+        // 以_token的大价格作为单价，计算美元价值为_usdAmount的_token的数量
         return usdToToken(_token, _usdAmount, getMaxPrice(_token));
     }
 
+    // 以_price作为_token的单价，计算美元价值为_usdAmount的_token的数量
+    // 注：_usdAmount和_price都是带价格精度30
     function usdToToken(address _token, uint256 _usdAmount, uint256 _price) public view returns (uint256) {
+        // 如果美元价值为0，直接返回0
         if (_usdAmount == 0) {return 0;}
+        // 获取_token的精度
         uint256 decimals = tokenDecimals[_token];
+        // 计算_token数量，即美元价值 * _token精度 / _token价格
         return _usdAmount.mul(10 ** decimals).div(_price);
     }
 
+    // 查询仓位信息
     function getPosition(address _account, address _collateralToken, address _indexToken, bool _isLong) public override view returns (uint256, uint256, uint256, uint256, uint256, uint256, bool, uint256) {
         bytes32 key = getPositionKey(_account, _collateralToken, _indexToken, _isLong);
         Position memory position = positions[key];
@@ -1062,7 +1192,10 @@ contract Vault is ReentrancyGuard, IVault {
         );
     }
 
+    // 计算_account账户下以_collateralToken作为抵押token，_indexToken作为标的token的多仓或空仓（由_isLong决定）的仓位key
+    // 注： 每一个仓位都有一个唯一对应的key
     function getPositionKey(address _account, address _collateralToken, address _indexToken, bool _isLong) public pure returns (bytes32) {
+        // 将_account、_collateralToken、_indexToken和_isLong压缩连接后取hash
         return keccak256(abi.encodePacked(
             _account,
             _collateralToken,
@@ -1136,30 +1269,62 @@ contract Vault is ReentrancyGuard, IVault {
 
     // for longs: nextAveragePrice = (nextPrice * nextSize)/ (nextSize + delta)
     // for shorts: nextAveragePrice = (nextPrice * nextSize) / (nextSize - delta)
+
+    // 计算经过加仓后的仓位均价（加权平均）
+    // 参数：
+    // - _indexToken: 仓位的标的token；
+    // - _size：原仓位大小；
+    // - _averagePrice：原仓位均价；
+    // - _isLong：true为加多仓，false为加空仓；
+    // - _nextPrice：加仓时，标的token的价格；
+    // - _sizeDelta：仓位改变的增量；
+    // - _lastIncreasedTime：最近一次加仓的时间戳
     function getNextAveragePrice(address _indexToken, uint256 _size, uint256 _averagePrice, bool _isLong, uint256 _nextPrice, uint256 _sizeDelta, uint256 _lastIncreasedTime) public view returns (uint256) {
+        // 根据传入的当前仓位的相关信息计算目前该仓位的盈亏情况
         (bool hasProfit, uint256 delta) = getDelta(_indexToken, _size, _averagePrice, _isLong, _lastIncreasedTime);
+        // nextSize为加仓后的仓位大小
         uint256 nextSize = _size.add(_sizeDelta);
+        // 定义除数
         uint256 divisor;
         if (_isLong) {
+            // 如果是多仓且仓位盈利，除数为：加仓后的仓位大小 + 盈利值
+            // 如果是多仓且仓位亏损，除数为：加仓后的仓位大小 - 盈利值
             divisor = hasProfit ? nextSize.add(delta) : nextSize.sub(delta);
         } else {
+            // 如果是空仓且仓位盈利，除数为：加仓后的仓位大小 - 盈利值
+            // 如果是空仓且仓位亏损，除数为：加仓后的仓位大小 + 盈利值
             divisor = hasProfit ? nextSize.sub(delta) : nextSize.add(delta);
         }
+
+        // 加仓后的仓位加权平均价格为：加仓时标的token价格 * 加仓后仓位大小 / 除数
         return _nextPrice.mul(nextSize).div(divisor);
     }
 
     // for longs: nextAveragePrice = (nextPrice * nextSize)/ (nextSize + delta)
     // for shorts: nextAveragePrice = (nextPrice * nextSize) / (nextSize - delta)
+    // 计算经过加空仓后的全局针对_indexToken的总空仓均价（加权平均）
+    // 参数：
+    // - _indexToken: 加空仓的标的token；
+    // - _nextPrice：加空仓时，标的token价格；
+    // - _sizeDelta：仓位改变的增量
     function getNextGlobalShortAveragePrice(address _indexToken, uint256 _nextPrice, uint256 _sizeDelta) public view returns (uint256) {
+        // size为 当前全局针对_indexToken的总空仓大小
         uint256 size = globalShortSizes[_indexToken];
+        // averagePrice为 当前全局针对_indexToken的总空仓均价
         uint256 averagePrice = globalShortAveragePrices[_indexToken];
+        // priceDelta为 | 当前全局针对_indexToken的总空仓均价 - 加空仓时的标的token价格 |
         uint256 priceDelta = averagePrice > _nextPrice ? averagePrice.sub(_nextPrice) : _nextPrice.sub(averagePrice);
+        // delta为 当前全局针对_indexToken的总空仓大小 * priceDelta / 当前全局针对_indexToken的总空仓均价
         uint256 delta = size.mul(priceDelta).div(averagePrice);
+        // hasProfit为 当前全局针对_indexToken的总空仓均价 是否大于 本次加空仓时的_indexToken价格
         bool hasProfit = averagePrice > _nextPrice;
-
+        // nextSize为 加空仓后的全局针对_indexToken的总空仓大小
         uint256 nextSize = size.add(_sizeDelta);
+        // 如果hasProfit为true，除数为：加空仓后的全局针对_indexToken的总空仓大小 - delta
+        // 如果hasProfit为true，除数为：加空仓后的全局针对_indexToken的总空仓大小 - delta
         uint256 divisor = hasProfit ? nextSize.sub(delta) : nextSize.add(delta);
 
+        // 加空仓后的全局针对_indexToken的总空仓均价为：加仓时标的token价格 * 加空仓后的全局针对_indexToken的总空仓大小 / 除数
         return _nextPrice.mul(nextSize).div(divisor);
     }
 
@@ -1182,42 +1347,81 @@ contract Vault is ReentrancyGuard, IVault {
         return getDelta(_indexToken, position.size, position.averagePrice, _isLong, position.lastIncreasedTime);
     }
 
+    // 根据当前仓位的相关信息计算仓位的盈亏情况。返回值有两个：1. 盈亏标志（盈利为true，亏损为false）；2. 盈亏价值
+    // 参数：
+    // - _indexToken：仓位的标的token；
+    // - _size：仓位大小；
+    // - _averagePrice：仓位均价；
+    // - _isLong：true为多仓，false为空仓；
+    // - _lastIncreasedTime：最近一次加仓的时间戳
+    // 注：如果对于同一仓位出现高频的加仓或减仓操作会触发最小盈利阈值限制检查
     function getDelta(address _indexToken, uint256 _size, uint256 _averagePrice, bool _isLong, uint256 _lastIncreasedTime) public override view returns (bool, uint256) {
+        // 要求仓位均价大于0
         _validate(_averagePrice > 0, 38);
+        // 获取标的token价格。如果是多仓，price为小价格；如果是空仓，price为大价格
         uint256 price = _isLong ? getMinPrice(_indexToken) : getMaxPrice(_indexToken);
+        // priceDelta为仓位均价与标的token价格的差值
         uint256 priceDelta = _averagePrice > price ? _averagePrice.sub(price) : price.sub(_averagePrice);
+        // 计算盈亏价值delta，即仓位仓位大小 * |仓位均价 - 标的token价格|/仓位均价
         uint256 delta = _size.mul(priceDelta).div(_averagePrice);
-
+        // 定义盈亏标志hasProfit
         bool hasProfit;
 
         if (_isLong) {
+            // 如果是多仓
+            // 只有当标的token价格price大于仓位均价时，盈亏标志hasProfit才为true。否则为false
             hasProfit = price > _averagePrice;
         } else {
+            // 如果是空仓
+            // 只有当标的token价格price小于仓位均价时，盈亏标志hasProfit才为true。否则为false
             hasProfit = _averagePrice > price;
         }
 
         // if the minProfitTime has passed then there will be no min profit threshold
         // the min profit threshold helps to prevent front-running issues
+
+        // 如果当前时间戳 距离 该仓位上一次加仓时间戳 大于 minProfitTime，minBps为0。否则，为minProfitBasisPoints[_indexToken]
         uint256 minBps = block.timestamp > _lastIncreasedTime.add(minProfitTime) ? 0 : minProfitBasisPoints[_indexToken];
+
         if (hasProfit && delta.mul(BASIS_POINTS_DIVISOR) <= _size.mul(minBps)) {
+            // 如果当前仓位盈利，但盈利价值/仓位大小 <= minBp/10000
+            // 系统将判定这种情况盈利价值为0
             delta = 0;
         }
 
+        // 返回盈亏标志和盈亏价值
         return (hasProfit, delta);
     }
 
+    // 计算资金费（USDG计价），即：仓位大小 * (抵押token当前累计资金费率 - 本仓位最近一次改变仓位大小时的累计资金费率)
+    // 参数：
+    // - _token：本仓位的抵押token；
+    // - _size：本仓位大小；
+    // - _entryFundingRate: 最近一次改变本仓位大小时的累计资金费率
     function getFundingFee(address _token, uint256 _size, uint256 _entryFundingRate) public view returns (uint256) {
+        // 仓位为0，无资金费，返回
         if (_size == 0) {return 0;}
 
+        // fundingRate为本次应缴纳的资金费率
+        // 即当前抵押token的累计资金费率 - 本仓位最近一次改变仓位大小时的累计资金费率
         uint256 fundingRate = cumulativeFundingRates[_token].sub(_entryFundingRate);
+        // 如果本次应缴纳的资金费率为0，无资金费，返回
         if (fundingRate == 0) {return 0;}
 
+        // 如果本次应缴纳的资金费率非0，应缴纳的资金费为：本仓位大小 * 本次应缴纳的资金费率 / FUNDING_RATE_PRECISION
         return _size.mul(fundingRate).div(FUNDING_RATE_PRECISION);
     }
 
+    // 通过仓位改变量_sizeDelta计算position fee（以USD计价，并带价格精度30）
+    // 即：_sizeDelta * marginFeeBasisPoints / 10000
     function getPositionFee(uint256 _sizeDelta) public view returns (uint256) {
+        // 改变量为0，position fee为0
         if (_sizeDelta == 0) {return 0;}
+        // afterFeeUsd为扣除position fee后的仓位改变量，即仓位改变量 * (10000 - 保证金手续费基点) / 10000
         uint256 afterFeeUsd = _sizeDelta.mul(BASIS_POINTS_DIVISOR.sub(marginFeeBasisPoints)).div(BASIS_POINTS_DIVISOR);
+        // position fee就是_sizeDelta - afterFeeUsd
+        // 注：之所以不直接用_sizeDelta * marginFeeBasisPoints / 10000计算，是因为该计算方式由于除法存在截断而导致计算结果略小于真实值
+        // 通过反向减的方式可以增大手续费
         return _sizeDelta.sub(afterFeeUsd);
     }
 
@@ -1375,31 +1579,56 @@ contract Vault is ReentrancyGuard, IVault {
         return (usdOut, usdOutAfterFee);
     }
 
+    // 校验仓位
+    // 注：该检查为sanity check，即要求 本仓位大小 一定不可小于 本仓位的抵押token的累计价值
     function _validatePosition(uint256 _size, uint256 _collateral) private view {
         if (_size == 0) {
+            // 如果仓位大小为0
+            // 严格要求此时的本仓位的抵押token累计价值为0
             _validate(_collateral == 0, 39);
             return;
         }
+        // 如果仓位大小不为0
+        // 要求 本仓位大小 一定不可小于 本仓位的抵押token的累计价值
         _validate(_size >= _collateral, 40);
     }
 
+    // 检查当前msg.sender与被操作账户_account的关系
+    // 三种情况可以通过检验：1. _account自己本人调用；2.Router合约来调用；3.被添加到_account的授权router名单中的地址来调用
+    // 注：只有{increasePosition}和{decreasePosition}时会调用
     function _validateRouter(address _account) private view {
+        // 如果是_account自己本人在操作自己的仓位，直接通过
         if (msg.sender == _account) {return;}
+        // 如果是通过Router合约来调用本合约，直接通过
         if (msg.sender == router) {return;}
+        // 如果都不是以上情况，那么要求当前msg.sender是被_account授权过的
         _validate(approvedRouters[_account][msg.sender], 41);
     }
 
+    // 加仓时对抵押token和标的token做的相关校验
+    // 注：此处对标的token做出了限制，即
+    // - 做多时，抵押token和标的token必须一样且只能做多非稳定币
+    // - 做空时，抵押token必须是稳定币且只能做空非稳定币
     function _validateTokens(address _collateralToken, address _indexToken, bool _isLong) private view {
         if (_isLong) {
+            // 如果是开多仓，那么：
+            // 抵押token必须和标的token相同，即如果想做多BTC，那么抵押物必须是BTC
             _validate(_collateralToken == _indexToken, 42);
+            // 抵押token必须是当前在册的白名单token
             _validate(whitelistedTokens[_collateralToken], 43);
+            // 抵押token不可以是稳定币
             _validate(!stableTokens[_collateralToken], 44);
             return;
         }
 
+        // 如果是开空仓，那么：
+        // 抵押token必须是当前在册的白名单token
         _validate(whitelistedTokens[_collateralToken], 45);
+        // 抵押token必须是稳定币
         _validate(stableTokens[_collateralToken], 46);
+        // 标的token不可以是稳定币
         _validate(!stableTokens[_indexToken], 47);
+        // 标的token是允许被做空的
         _validate(shortableTokens[_indexToken], 48);
     }
 
@@ -1418,16 +1647,33 @@ contract Vault is ReentrancyGuard, IVault {
         return afterFeeAmount;
     }
 
+    // 收加减仓手续费（即margin fee，以USDG计价），返回值为收取的margin fee
+    // 注：
+    // 1. margin fee由两部分组成：1. position fee；2. funding fee;
+    // 2. 手续费以_token的形式收。
+    // 参数：
+    // - _token：仓位的抵押token；
+    // - _sizeDelta：仓位改变的增量（以USD计价，并带价格精度30)；
+    // - _size：仓位改变前的仓位大小；
+    // - _entryFundingRate：最近一次改变仓位大小时的累计资金费率。
     function _collectMarginFees(address _token, uint256 _sizeDelta, uint256 _size, uint256 _entryFundingRate) private returns (uint256) {
+        // 通过仓位改变量_sizeDelta计算position fee（以USD计价，并带价格精度30）
+        // 注：该部分手续费是由仓位增量产生
         uint256 feeUsd = getPositionFee(_sizeDelta);
-
+        // fundingFee为本仓位产生的资金费（以USD计价，并带价格精度30）
+        // 注：该部分手续费是由原仓位产生
         uint256 fundingFee = getFundingFee(_token, _size, _entryFundingRate);
+        // 要收取的margin fee为position fee和资金费之和
         feeUsd = feeUsd.add(fundingFee);
 
+        // 以_token的大价格作为单价，计算margin fee等价值的_token的数量
         uint256 feeTokens = usdToTokenMin(_token, feeUsd);
+        // _token的累计手续费自增feeTokens
         feeReserves[_token] = feeReserves[_token].add(feeTokens);
 
+        // 抛出事件
         emit CollectMarginFees(_token, feeUsd, feeTokens);
+        // 返回收取的margin fee
         return feeUsd;
     }
 
@@ -1527,6 +1773,7 @@ contract Vault is ReentrancyGuard, IVault {
         emit DecreaseUsdgAmount(_token, _amount);
     }
 
+    // 增加为全局保留_token的产生的USDG债务，增量为_amount
     function _increaseReservedAmount(address _token, uint256 _amount) private {
         reservedAmounts[_token] = reservedAmounts[_token].add(_amount);
         _validate(reservedAmounts[_token] <= poolAmounts[_token], 52);
