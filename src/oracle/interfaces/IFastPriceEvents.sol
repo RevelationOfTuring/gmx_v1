@@ -1,8 +1,7 @@
-// SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.0;
+// SPDX-License-Identifier: MIT
 
-contract IFastPriceEvents {
-    constructor(){
+pragma solidity 0.6.12;
 
-    }
+interface IFastPriceEvents {
+    function emitPriceEvent(address _token, uint256 _price) external;
 }
