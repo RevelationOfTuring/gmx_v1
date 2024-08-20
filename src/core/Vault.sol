@@ -177,13 +177,16 @@ contract Vault is ReentrancyGuard, IVault {
 
     // poolAmounts tracks the number of received tokens that can be used for leverage
     // this is tracked separately from tokenBalances to exclude funds that are deposited as margin collateral
-    // token地址 -> 全局可用于开杠杆头寸的该token的数量（可以理解为闲置的该token数量）
-    // 注：poolAmounts与tokenBalances不一样，前者中不包含已抵押作为保证金的该token数量
+    // token地址 -> 全局可用于开杠杆头寸的该token的数量，即Vault合约收到的该token并扣除手续费后的累计token数量
+    // todo: delete ? 注：poolAmounts与tokenBalances不一样，前者中不包含已抵押作为保证金的该token数量
     mapping(address => uint256) public override poolAmounts;
 
     // reservedAmounts tracks the number of tokens reserved for open leverage positions
-    // token地址 -> 目前池中已用于开杠杆的该token数量（即锁定在未平仓杠杆头寸中的token数量）
-    // todo?
+    // token地址 -> 全局用于兑付所有仓位（以该token为抵押token的仓位）头寸的该token数量，即每次加仓时的仓位增量换算成该token的数量的累计和
+    // 也可以理解为平台保证金（能100% cover住仓位的头寸）
+    // 注：
+    // - 如果token地址为稳定币，表示所有抵押该稳定币来做空其他非稳定币的仓位的position.reserveAmount之和
+    // - 如果token地址为非稳定币，表示所有抵押该非稳定币来做多自己的仓位的position.reserveAmount之和
     mapping(address => uint256) public override reservedAmounts;
 
     // bufferAmounts allows specification of an amount to exclude from swaps
@@ -197,6 +200,12 @@ contract Vault is ReentrancyGuard, IVault {
     // this is an estimated amount, it is possible for the actual guaranteed value to be lower
     // in the case of sudden price decreases, the guaranteed value should be corrected
     // after liquidations are carried out
+    // token地址(非稳定币) -> 全局做多该token的每个仓位的(position.size-position.collateral)之和
+    // 即：一个用户开了10倍杠杆做多，除了他自己的抵押token提供的1x的美元债务外，其余的9x美元债务相当于Vault池子借给他的
+    // 例子：guaranteedUsd[WBTC]的值表示：全部BTC的多仓向池子借的美元债务
+//guaranteedUsd 跟踪由已开启的杠杆头寸“保证”的美元金额。
+//此值用于计算出售 USDG 的赎回价值。
+//这是一个估计值，在价格突然下跌的情况下，实际的保证金额可能会更低，在进行清算后，应对保证金额进行修正。
     mapping(address => uint256) public override guaranteedUsd;
 
     // cumulativeFundingRates tracks the funding rates based on utilization
@@ -850,19 +859,31 @@ contract Vault is ReentrancyGuard, IVault {
         uint256 reserveDelta = usdToTokenMax(_collateralToken, _sizeDelta);
         // 本仓位的仓位大小对应的抵押token累计数量自增reserveDelta
         position.reserveAmount = position.reserveAmount.add(reserveDelta);
+        // 抵押token的平台保证金也自增reserveDelta
         _increaseReservedAmount(_collateralToken, reserveDelta);
 
         if (_isLong) {
             // 如果是加仓多仓
+
             // guaranteedUsd stores the sum of (position.size - position.collateral) for all positions
             // if a fee is charged on the collateral then guaranteedUsd should be increased by that fee amount
             // since (position.size - position.collateral) would have increased by `fee`
+            // guaranteedUsd用于记录全局每个仓位中(position.size-position.collateral)之和
+            // 由本次加仓导致的△position.collateral为collateralDeltaUsd - fee，△position.size为_sizeDelta，
+            // 所以guaranteedUsd[_collateralToken]的增量就是：
+            //      △position.size-△position.collateral=size为_sizeDelta - collateralDeltaUsd + fee
+            // guaranteedUsd[_collateralToken]自增_sizeDelta+fee
             _increaseGuaranteedUsd(_collateralToken, _sizeDelta.add(fee));
+            // guaranteedUsd[_collateralToken]减少_sizeDelta+fee
             _decreaseGuaranteedUsd(_collateralToken, collateralDeltaUsd);
             // treat the deposited collateral as part of the pool
+            // 由于本次加多仓有抵押token流入，所以需要增加poolAmount[_collateralToken]，
+            // 增量为 流入抵押token美元价值 - fee
+            // poolAmount[_collateralToken]增加流入抵押token美元价值collateralDelta
             _increasePoolAmount(_collateralToken, collateralDelta);
             // fees need to be deducted from the pool since fees are deducted from position.collateral
             // and collateral is treated as part of the pool
+            // poolAmount[_collateralToken]减少fee
             _decreasePoolAmount(_collateralToken, usdToTokenMin(_collateralToken, fee));
         } else {
             // 如果是加仓空仓
@@ -882,12 +903,24 @@ contract Vault is ReentrancyGuard, IVault {
         emit UpdatePosition(key, position.size, position.collateral, position.averagePrice, position.entryFundingRate, position.reserveAmount, position.realisedPnl);
     }
 
+
     function decreasePosition(address _account, address _collateralToken, address _indexToken, uint256 _collateralDelta, uint256 _sizeDelta, bool _isLong, address _receiver) external override nonReentrant returns (uint256) {
+        // 防止交易给出过高的gas price（防MEV）
         _validateGasPrice();
+        // 检查当前msg.sender与被操作账户_account的关系
         _validateRouter(_account);
         return _decreasePosition(_account, _collateralToken, _indexToken, _collateralDelta, _sizeDelta, _isLong, _receiver);
     }
 
+    // 进行减仓
+    // 参数：
+    // - _account：仓位持有人地址；
+    // - _collateralToken：抵押token地址；
+    // - _indexToken：标的token地址；
+    // - _collateralDelta：
+    // - _sizeDelta：仓位改变的增量（以USD计价，并带价格精度30）
+    // - _isLong：true为减多仓，false为减空仓
+    // - _receiver：
     function _decreasePosition(address _account, address _collateralToken, address _indexToken, uint256 _collateralDelta, uint256 _sizeDelta, bool _isLong, address _receiver) private returns (uint256) {
         updateCumulativeFundingRate(_collateralToken);
 
@@ -1260,10 +1293,20 @@ contract Vault is ReentrancyGuard, IVault {
         return reservedAmounts[_token].mul(FUNDING_RATE_PRECISION).div(poolAmount);
     }
 
+    // 计算仓位的杠杆倍数（带4位精度）
+    // 参数：
+    // - _account：仓位持有人地址；
+    // - _collateralToken：抵押token地址；
+    // - _indexToken：标的token地址；
+    // - _isLong：true为加多仓，false为加空仓
     function getPositionLeverage(address _account, address _collateralToken, address _indexToken, bool _isLong) public view returns (uint256) {
+        // 计算目标仓位的key
         bytes32 key = getPositionKey(_account, _collateralToken, _indexToken, _isLong);
+        // 获取指向目标仓位的storage指针
         Position memory position = positions[key];
+        // 要求目标仓位中的抵押token的累计价值大于0
         _validate(position.collateral > 0, 37);
+        // 本仓位的杠杆倍数为：仓位大小 * 10000 / 抵押token的累计价值
         return position.size.mul(BASIS_POINTS_DIVISOR).div(position.collateral);
     }
 
@@ -1773,9 +1816,12 @@ contract Vault is ReentrancyGuard, IVault {
         emit DecreaseUsdgAmount(_token, _amount);
     }
 
-    // 增加为全局保留_token的产生的USDG债务，增量为_amount
+    // 增加_token的平台保证金，增量为_amount
+    // 注：_token在实际业务中是加仓的抵押token
     function _increaseReservedAmount(address _token, uint256 _amount) private {
+        // _token的平台保证金数量增加_amount
         reservedAmounts[_token] = reservedAmounts[_token].add(_amount);
+        // 要求增加后的_token的平台保证金数量不可大于
         _validate(reservedAmounts[_token] <= poolAmounts[_token], 52);
         emit IncreaseReservedAmount(_token, _amount);
     }
@@ -1785,6 +1831,7 @@ contract Vault is ReentrancyGuard, IVault {
         emit DecreaseReservedAmount(_token, _amount);
     }
 
+    // 增加为全局保留_token，增量为_amount
     function _increaseGuaranteedUsd(address _token, uint256 _usdAmount) private {
         guaranteedUsd[_token] = guaranteedUsd[_token].add(_usdAmount);
         emit IncreaseGuaranteedUsd(_token, _usdAmount);
